@@ -214,3 +214,23 @@ func TestShadow_IsShadow(t *testing.T) {
 		t.Error("shadow workspace should report IsShadow=true")
 	}
 }
+
+func TestShadow_ReadFallsThrough_Subdirectory(t *testing.T) {
+	lower := t.TempDir()
+	upper := t.TempDir()
+
+	// File in a subdirectory of lower.
+	os.MkdirAll(filepath.Join(lower, "src"), 0o755)
+	os.WriteFile(filepath.Join(lower, "src", "main.py"), []byte("from host"), 0o600)
+
+	ws := NewShadow(upper, lower)
+
+	got, err := ws.ResolveRead("src/main.py")
+	if err != nil {
+		t.Fatalf("ResolveRead: %v", err)
+	}
+	data, _ := os.ReadFile(got)
+	if string(data) != "from host" {
+		t.Errorf("expected 'from host', got %q (path: %s)", string(data), got)
+	}
+}
