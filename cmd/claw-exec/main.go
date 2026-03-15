@@ -27,10 +27,12 @@ const (
 
 // processEntry tracks a background process.
 type processEntry struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	outBuf *limitedBuffer
-	errBuf *limitedBuffer
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	outBuf   *limitedBuffer
+	errBuf   *limitedBuffer
+	done     chan struct{} // closed when cmd.Wait() returns
+	exitCode int
 }
 
 type processTable struct {
@@ -195,7 +197,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		entry := &processEntry{cmd: cmd, stdin: stdin, outBuf: outBuf, errBuf: errBuf}
+		entry := &processEntry{cmd: cmd, stdin: stdin, outBuf: outBuf, errBuf: errBuf, done: make(chan struct{})}
 		id, err := pt.add(entry)
 		if err != nil {
 			_ = cmd.Process.Kill()
@@ -205,6 +207,10 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 		// Reap in background to avoid zombies.
 		go func() {
 			_ = cmd.Wait()
+			if cmd.ProcessState != nil {
+				entry.exitCode = cmd.ProcessState.ExitCode()
+			}
+			close(entry.done)
 		}()
 
 		return mcpserver.SuccessResult(fmt.Sprintf(`{"pid": %d}`, id))
@@ -264,7 +270,13 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult(fmt.Sprintf("no process with pid %d", p.PID))
 		}
 
-		running := entry.cmd.ProcessState == nil
+		// Check if process has exited via the done channel (race-free).
+		running := true
+		select {
+		case <-entry.done:
+			running = false
+		default:
+		}
 
 		stdout := entry.outBuf.Drain()
 		stderr := entry.errBuf.Drain()
@@ -280,8 +292,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 		// Clean up finished processes.
 		if !running {
-			exitCode := entry.cmd.ProcessState.ExitCode()
-			fmt.Fprintf(&buf, "exit_code: %d\n", exitCode)
+			fmt.Fprintf(&buf, "exit_code: %d\n", entry.exitCode)
 			pt.remove(p.PID)
 		}
 
