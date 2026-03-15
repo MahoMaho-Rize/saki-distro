@@ -1,0 +1,13 @@
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /claw-fs ./cmd/claw-fs
+
+FROM alpine:3.21
+RUN adduser -D -u 1000 agent
+COPY --from=build /claw-fs /usr/local/bin/claw-fs
+USER agent
+EXPOSE 9100
+CMD ["claw-fs"]

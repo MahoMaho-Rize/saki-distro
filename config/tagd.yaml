@@ -1,0 +1,32 @@
+# TAG Gateway config for Claw Distro
+# Minimal config — most values use TAG defaults.
+
+listen: ":8080"
+max_react_iterations: 10
+sse_keepalive_ms: 15000
+
+providers:
+  - name: anthropic
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+    models:
+      - name: "claude-sonnet-4-20250514"
+        context_window: 200000
+        max_output_tokens: 16384
+
+mcp:
+  inject_mode: "auto"
+  refresh_interval_sec: 60
+  servers:
+    - name: fs
+      transport: http
+      url: "http://claw-fs:9100/mcp"
+      timeout_sec: 30
+    - name: exec
+      transport: http
+      url: "http://claw-exec:9101/mcp"
+      timeout_sec: 120
+
+log:
+  level: "info"
+  pretty: true

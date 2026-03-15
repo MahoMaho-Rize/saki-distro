@@ -1,0 +1,17 @@
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /claw-exec ./cmd/claw-exec
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash curl git python3 python3-pip nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 agent
+COPY --from=build /claw-exec /usr/local/bin/claw-exec
+USER agent
+WORKDIR /workspace
+EXPOSE 9101
+CMD ["claw-exec"]
