@@ -27,7 +27,14 @@ func main() {
 		addr = ":9100"
 	}
 
-	ws := workspace.New(root)
+	// Shadow layer mode: CLAW_HOST_PROJECT sets a read-only lower layer.
+	// Agent reads from host project, writes to workspace (upper layer).
+	var ws *workspace.W
+	if hostProject := os.Getenv("CLAW_HOST_PROJECT"); hostProject != "" {
+		ws = workspace.NewShadow(root, hostProject)
+	} else {
+		ws = workspace.New(root)
+	}
 	if err := ws.EnsureRoot(); err != nil {
 		fmt.Fprintf(os.Stderr, "claw-fs: ensure workspace: %v\n", err)
 		os.Exit(1)
@@ -65,7 +72,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		abs, err := ws.Resolve(p.Path)
+		abs, err := ws.ResolveRead(p.Path)
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
@@ -150,12 +157,13 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		abs, err := ws.Resolve(p.Path)
+		// Read from shadow (may be in lower layer).
+		readAbs, err := ws.ResolveRead(p.Path)
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		data, err := os.ReadFile(abs)
+		data, err := os.ReadFile(readAbs)
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
@@ -171,8 +179,16 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult(fmt.Sprintf("old_string found %d times; must be unique", count))
 		}
 
+		// Write to upper layer.
+		writeAbs, err := ws.Resolve(p.Path)
+		if err != nil {
+			return mcpserver.ErrorResult(err.Error())
+		}
 		result := strings.Replace(content, p.OldString, p.NewString, 1)
-		if err := os.WriteFile(abs, []byte(result), 0o600); err != nil {
+		if err := os.MkdirAll(filepath.Dir(writeAbs), 0o755); err != nil {
+			return mcpserver.ErrorResult(err.Error())
+		}
+		if err := os.WriteFile(writeAbs, []byte(result), 0o600); err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
 		return mcpserver.SuccessResult("ok")
@@ -197,18 +213,12 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		abs, err := ws.Resolve(p.Path)
-		if err != nil {
-			return mcpserver.ErrorResult(err.Error())
-		}
-
 		var buf strings.Builder
 		if p.Recursive {
-			_ = filepath.WalkDir(abs, func(path string, d fs.DirEntry, walkErr error) error {
-				if walkErr != nil {
+			_ = ws.WalkMerged(p.Path, func(rel string, d fs.DirEntry, err error) error {
+				if err != nil {
 					return fs.SkipDir
 				}
-				rel, _ := filepath.Rel(ws.Root(), path)
 				if d.IsDir() {
 					fmt.Fprintf(&buf, "%s/\n", rel)
 				} else {
@@ -217,7 +227,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 				return nil
 			})
 		} else {
-			entries, err := os.ReadDir(abs)
+			entries, err := ws.ListMerged(p.Path)
 			if err != nil {
 				return mcpserver.ErrorResult(err.Error())
 			}
@@ -252,18 +262,12 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		base, err := ws.Resolve(p.Path)
-		if err != nil {
-			return mcpserver.ErrorResult(err.Error())
-		}
-
 		var matches []string
-		_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
+		_ = ws.WalkMerged(p.Path, func(rel string, d fs.DirEntry, err error) error {
+			if err != nil {
 				return fs.SkipDir
 			}
-			rel, _ := filepath.Rel(base, path)
-			matched, _ := filepath.Match(p.Pattern, filepath.Base(path))
+			matched, _ := filepath.Match(p.Pattern, filepath.Base(rel))
 			if matched {
 				matches = append(matches, rel)
 			}
@@ -299,14 +303,9 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult("invalid regex: " + err.Error())
 		}
 
-		base, err := ws.Resolve(p.Path)
-		if err != nil {
-			return mcpserver.ErrorResult(err.Error())
-		}
-
 		var buf strings.Builder
 		matchCount := 0
-		_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, walkErr error) error {
+		_ = ws.WalkMerged(p.Path, func(rel string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return fs.SkipDir
 			}
@@ -319,11 +318,15 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 					return nil
 				}
 			}
-			data, readErr := os.ReadFile(path)
+			// Resolve full path for reading (shadow fallthrough).
+			readPath, readErr := ws.ResolveRead(rel)
+			if readErr != nil {
+				return nil //nolint:nilerr // skip files that can't be resolved
+			}
+			data, readErr := os.ReadFile(readPath)
 			if readErr != nil {
 				return nil //nolint:nilerr // skip unreadable files
 			}
-			rel, _ := filepath.Rel(ws.Root(), path)
 			lines := strings.Split(string(data), "\n")
 			for i, line := range lines {
 				if re.MatchString(line) {
