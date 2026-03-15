@@ -8,6 +8,8 @@ GOFLAGS := -trimpath
 build: ## Build all binaries
 	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-fs ./cmd/claw-fs
 	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-exec ./cmd/claw-exec
+	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-web ./cmd/claw-web
+	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/context-mgr ./hooks/context-mgr
 
 .PHONY: test
 test: ## Run all tests
