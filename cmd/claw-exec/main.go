@@ -1,6 +1,7 @@
-// claw-exec is an MCP Server that provides shell execution tools for the Claw coding agent.
-// It exposes exec, process_start, process_send, and process_poll as MCP tools.
-// All commands run inside the container, confined to the workspace directory.
+// claw-exec is an MCP Server that provides shell execution tools.
+// All commands run inside Docker containers with workspace volume mount.
+// The MCP server itself runs on the host; it spawns Docker containers
+// for each command execution.
 package main
 
 import (
@@ -11,7 +12,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"claw-distro/internal/mcpserver"
@@ -25,14 +28,36 @@ const (
 	maxProcessCount = 32
 )
 
-// processEntry tracks a background process.
+// Container configuration
+var (
+	containerImage = envOr("CLAW_EXEC_IMAGE", "ubuntu:24.04")
+	containerMem   = envOr("CLAW_EXEC_MEMORY", "512m")
+	containerCPU   = envOr("CLAW_EXEC_CPUS", "2")
+	containerPids  = envOr("CLAW_EXEC_PIDS", "100")
+	networkMode    = envOr("CLAW_EXEC_NETWORK", "bridge") // bridge for pip/npm; "none" for full isolation
+	containerSeq   int64
+)
+
+// Proxy env vars to pass into containers
+var proxyEnvVars []string
+
+func init() {
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"} {
+		if v := os.Getenv(key); v != "" {
+			proxyEnvVars = append(proxyEnvVars, key+"="+v)
+		}
+	}
+}
+
+// processEntry tracks a background container.
 type processEntry struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	outBuf   *limitedBuffer
-	errBuf   *limitedBuffer
-	done     chan struct{} // closed when cmd.Wait() returns
-	exitCode int
+	containerName string
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	outBuf        *limitedBuffer
+	errBuf        *limitedBuffer
+	done          chan struct{}
+	exitCode      int
 }
 
 type processTable struct {
@@ -67,6 +92,11 @@ func (pt *processTable) get(id int) (*processEntry, bool) {
 func (pt *processTable) remove(id int) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
+	if e, ok := pt.entries[id]; ok {
+		// Cleanup container
+		cleanup := exec.Command("docker", "rm", "-f", e.containerName)
+		_ = cleanup.Run()
+	}
 	delete(pt.entries, id)
 }
 
@@ -83,7 +113,7 @@ func main() {
 	ws := workspace.New(root)
 	pt := newProcessTable()
 
-	srv := mcpserver.New("claw-exec", "0.1.0")
+	srv := mcpserver.New("claw-exec", "0.2.0")
 	registerTools(srv, ws, pt)
 
 	if err := srv.ListenAndServe(addr); err != nil {
@@ -92,10 +122,34 @@ func main() {
 	}
 }
 
+// buildDockerArgs constructs the common docker run arguments.
+func buildDockerArgs(containerName, workDir string, timeout time.Duration) []string {
+	args := []string{
+		"run", "--rm",
+		"--name", containerName,
+		"--network", networkMode,
+		"--memory", containerMem,
+		"--cpus", containerCPU,
+		"--pids-limit", containerPids,
+		"--security-opt", "no-new-privileges",
+		"-v", workDir + ":/workspace",
+		"-w", "/workspace",
+	}
+	// Pass proxy env vars into container
+	for _, env := range proxyEnvVars {
+		args = append(args, "-e", env)
+	}
+	return args
+}
+
+func nextContainerName() string {
+	return fmt.Sprintf("saki-exec-%d-%d", os.Getpid(), atomic.AddInt64(&containerSeq, 1))
+}
+
 func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 	srv.AddTool(mcpserver.Tool{
 		Name:        "exec",
-		Description: "Execute a shell command and return stdout, stderr, and exit code. Blocks until completion or timeout.",
+		Description: "Execute a shell command in an isolated Docker container. Returns stdout, stderr, and exit code.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"command"},
@@ -123,20 +177,21 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			}
 		}
 
-		dir := ws.Root()
-		if p.WorkingDir != "" {
-			resolved, err := ws.Resolve(p.WorkingDir)
-			if err != nil {
-				return mcpserver.ErrorResult(err.Error())
-			}
-			dir = resolved
-		}
+		containerName := nextContainerName()
+		dockerArgs := buildDockerArgs(containerName, ws.Root(), timeout)
+		dockerArgs = append(dockerArgs, containerImage, "sh", "-c", p.Command)
 
 		execCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(execCtx, "sh", "-c", p.Command)
-		cmd.Dir = dir
+		// Zombie cleanup
+		go func() {
+			<-execCtx.Done()
+			killCmd := exec.Command("docker", "kill", containerName)
+			_ = killCmd.Run()
+		}()
+
+		cmd := exec.CommandContext(execCtx, "docker", dockerArgs...)
 
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &limitedWriter{w: &stdout, limit: maxOutputBytes}
@@ -147,6 +202,8 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
+			} else if strings.Contains(err.Error(), "signal: killed") {
+				exitCode = 137 // SIGKILL from timeout
 			} else {
 				return mcpserver.ErrorResult(err.Error())
 			}
@@ -164,7 +221,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 	srv.AddTool(mcpserver.Tool{
 		Name:        "process_start",
-		Description: "Start a long-running background process. Returns a process ID for send/poll.",
+		Description: "Start a long-running background process in a Docker container. Returns a process ID for send/poll.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"command"},
@@ -180,8 +237,11 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		cmd := exec.Command("sh", "-c", p.Command)
-		cmd.Dir = ws.Root()
+		containerName := nextContainerName()
+		dockerArgs := buildDockerArgs(containerName, ws.Root(), maxTimeout)
+		dockerArgs = append(dockerArgs, "-i", containerImage, "sh", "-c", p.Command)
+
+		cmd := exec.Command("docker", dockerArgs...)
 
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -197,14 +257,21 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		entry := &processEntry{cmd: cmd, stdin: stdin, outBuf: outBuf, errBuf: errBuf, done: make(chan struct{})}
+		entry := &processEntry{
+			containerName: containerName,
+			cmd:           cmd,
+			stdin:         stdin,
+			outBuf:        outBuf,
+			errBuf:        errBuf,
+			done:          make(chan struct{}),
+		}
 		id, err := pt.add(entry)
 		if err != nil {
 			_ = cmd.Process.Kill()
+			_ = exec.Command("docker", "rm", "-f", containerName).Run()
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		// Reap in background to avoid zombies.
 		go func() {
 			_ = cmd.Wait()
 			if cmd.ProcessState != nil {
@@ -270,7 +337,6 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult(fmt.Sprintf("no process with pid %d", p.PID))
 		}
 
-		// Check if process has exited via the done channel (race-free).
 		running := true
 		select {
 		case <-entry.done:
@@ -290,7 +356,6 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			fmt.Fprintf(&buf, "--- stderr ---\n%s", stderr)
 		}
 
-		// Clean up finished processes.
 		if !running {
 			fmt.Fprintf(&buf, "exit_code: %d\n", entry.exitCode)
 			pt.remove(p.PID)
@@ -300,7 +365,8 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 	})
 }
 
-// limitedWriter caps writes at a byte limit; excess is silently discarded.
+// --- helpers ---
+
 type limitedWriter struct {
 	w     io.Writer
 	limit int
@@ -310,7 +376,7 @@ type limitedWriter struct {
 func (lw *limitedWriter) Write(p []byte) (int, error) {
 	remaining := lw.limit - lw.n
 	if remaining <= 0 {
-		return len(p), nil // discard
+		return len(p), nil
 	}
 	if len(p) > remaining {
 		p = p[:remaining]
@@ -320,7 +386,6 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// limitedBuffer is a concurrency-safe buffer with a byte cap and drain semantics.
 type limitedBuffer struct {
 	mu    sync.Mutex
 	buf   bytes.Buffer
@@ -344,7 +409,6 @@ func (lb *limitedBuffer) Write(p []byte) (int, error) {
 	return lb.buf.Write(p)
 }
 
-// Drain returns accumulated data and resets the buffer.
 func (lb *limitedBuffer) Drain() string {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
@@ -356,4 +420,11 @@ func (lb *limitedBuffer) Drain() string {
 func jsonSchema(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
