@@ -1,0 +1,54 @@
+# claw-distro — golangci-lint config
+# Mirrors TAG Gateway's standards with distro-appropriate adjustments.
+
+run:
+  timeout: 2m
+
+linters:
+  enable:
+    # Correctness
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - nilerr
+    # Resource safety
+    - bodyclose
+    - durationcheck
+    - gocritic
+    # Security
+    - gosec
+    # Style
+    - errname
+    - unconvert
+    - misspell
+    - asciicheck
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (io.Closer).Close
+      - io.Copy
+      - (net/http.ResponseWriter).Write
+      - fmt.Fprintf
+      - fmt.Fprintln
+  gosec:
+    excludes:
+      - G204 # exec.Command — expected in claw-exec
+  misspell:
+    locale: US
+    ignore-words:
+      - cancelled
+      - behaviour
+  govet:
+    disable:
+      - fieldalignment
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
