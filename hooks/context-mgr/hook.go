@@ -104,27 +104,23 @@ func (h *contextMgrHook) Process(_ context.Context, params *hooklib.ProcessParam
 
 // Notify handles POST_RESP: extract assistant response from react_trace,
 // emit save_messages for session-hook to persist.
-func (h *contextMgrHook) Notify(params *hooklib.NotifyParams) {
+func (h *contextMgrHook) Notify(params *hooklib.NotifyParams) *hooklib.NotifyResult {
 	if params.Phase != hooklib.PhasePostResp {
-		return
+		return nil
 	}
 
 	// Extract react_trace from gateway metadata.
 	trace := extractReactTrace(params.Metadata)
 
 	// Build assistant messages to save.
-	// If there's a react_trace, the assistant made tool calls and
-	// we save the final text response (last step or final content).
-	// If no trace, it was a pure text response — we can't see it
-	// from POST_RESP HEADER_ONLY mode (body is nil). This is a known
-	// limitation: pure text responses without tool calls don't get
-	// the assistant message persisted via this path. The session-hook
-	// can be enhanced to capture these via a separate mechanism.
+	// If there's a react_trace, the assistant made tool calls —
+	// we save a summary as the assistant message.
+	// If no trace, it was a pure text response — we can't capture it
+	// from POST_RESP HEADER_ONLY mode. Known limitation.
 	if trace == nil {
-		return
+		return nil
 	}
 
-	// Build a summary of what the assistant did.
 	var assistantParts []interface{}
 	for _, step := range trace.Steps {
 		assistantParts = append(assistantParts, map[string]interface{}{
@@ -140,7 +136,7 @@ func (h *contextMgrHook) Notify(params *hooklib.NotifyParams) {
 	}
 
 	if len(assistantParts) == 0 {
-		return
+		return nil
 	}
 
 	contentJSON, _ := json.Marshal(assistantParts)
@@ -150,18 +146,15 @@ func (h *contextMgrHook) Notify(params *hooklib.NotifyParams) {
 	}
 	msgJSON, _ := json.Marshal(assistantMsg)
 
-	// NOTE: Notify() has no return value. We cannot emit metadata here.
-	// The save_messages for the user message was already emitted in PRE_REQ.
-	// For the assistant message, we rely on the PRE_REQ save_messages
-	// which was already dispatched to session-hook.
-	//
-	// TODO: To save assistant messages, either:
-	// 1. Implement a direct store call from this hook
-	// 2. Enhance the protocol to allow Notify to emit metadata
-	// 3. Save both user and predicted-assistant in next PRE_REQ
-	//
-	// For now, we log the trace for observability.
-	_ = msgJSON
+	// Emit save_messages via metadata_patch. NotifyChained runs POST_RESP
+	// hooks in reverse order (onion model), so context-mgr (order 20) runs
+	// before session-hook (order 10). session-hook will see this patch.
+	return &hooklib.NotifyResult{
+		Action: hooklib.ActionContinue,
+		MetadataPatch: map[string]interface{}{
+			"save_messages": []json.RawMessage{json.RawMessage(msgJSON)},
+		},
+	}
 }
 
 // --- helpers ---
