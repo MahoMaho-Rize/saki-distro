@@ -22,7 +22,10 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.claw-fs
     volumes:
-      - workspace:/workspace
+      - ${HOST_PROJECT:-.}:/host-project:ro  # read-only host mount
+      - workspace:/workspace                  # writable staging
+    environment:
+      - CLAW_HOST_PROJECT=/host-project
     networks:
       - claw-internal
 
@@ -31,6 +34,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.claw-exec
     volumes:
+      - ${HOST_PROJECT:-.}:/host-project:ro
       - workspace:/workspace
     networks:
       - claw-internal
