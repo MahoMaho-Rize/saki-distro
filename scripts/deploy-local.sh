@@ -61,6 +61,9 @@ providers:
       - name: "claude-opus-4-6"
         context_window: 1000000
         max_output_tokens: 128000
+      - name: "claude-sonnet-4-6"
+        context_window: 1000000
+        max_output_tokens: 128000
 
 mcp:
   inject_mode: "auto"
@@ -127,7 +130,9 @@ env $FS_ENV "$PROJECT_DIR/bin/claw-fs" > "$DATA_DIR/claw-fs.log" 2>&1 &
 echo "$!" > "$PID_DIR/claw-fs.pid"
 echo "  starting claw-fs... pid=$!"
 
-start_service "claw-exec" env CLAW_WORKSPACE="$WORKSPACE" CLAW_EXEC_ADDR=":${EXEC_PORT}" "$PROJECT_DIR/bin/claw-exec"
+start_service "claw-exec" env CLAW_WORKSPACE="$WORKSPACE" CLAW_EXEC_ADDR=":${EXEC_PORT}" \
+    HTTP_PROXY="socks5h://127.0.0.1:1080" HTTPS_PROXY="socks5h://127.0.0.1:1080" ALL_PROXY="socks5h://127.0.0.1:1080" \
+    "$PROJECT_DIR/bin/claw-exec"
 start_service "claw-web" env CLAW_WEB_ADDR=":${WEB_PORT}" "$PROJECT_DIR/bin/claw-web"
 start_service "claw-browser" env CLAW_BROWSER_ADDR=":${BROWSER_PORT}" "$PROJECT_DIR/bin/claw-browser"
 
