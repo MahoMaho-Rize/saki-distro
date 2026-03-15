@@ -25,7 +25,7 @@ const defaultEndpoint = "http://localhost:8080/v1/chat/completions"
 
 func main() {
 	endpoint := flag.String("endpoint", envOr("CLAW_ENDPOINT", defaultEndpoint), "TAG Gateway endpoint")
-	model := flag.String("model", envOr("CLAW_MODEL", "claude-sonnet-4-20250514"), "LLM model name")
+	model := flag.String("model", envOr("CLAW_MODEL", "claude-opus-4-6"), "LLM model name")
 	session := flag.String("s", envOr("CLAW_SESSION", ""), "session key for multi-turn (auto-generated if empty)")
 	system := flag.String("system", "", "system prompt override")
 	interactive := flag.Bool("i", false, "interactive mode (multi-turn REPL)")
