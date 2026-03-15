@@ -1,0 +1,33 @@
+# TAG Gateway config for integration testing
+# Minimal: 1 provider + 2 MCP servers, no auth, no ext_proc
+
+listen: ":18080"
+max_react_iterations: 10
+sse_keepalive_ms: 15000
+
+providers:
+  - name: anthropic
+    # TAG appends /v1/messages, so strip /api/v1 from relay URL
+    base_url: "http://192.168.190.105:8088/api"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    models:
+      - name: "claude-sonnet-4-20250514"
+        context_window: 200000
+        max_output_tokens: 16384
+
+mcp:
+  inject_mode: "auto"
+  refresh_interval_sec: 300
+  servers:
+    - name: fs
+      transport: http
+      url: "http://127.0.0.1:19100/mcp"
+      timeout_sec: 30
+    - name: exec
+      transport: http
+      url: "http://127.0.0.1:19101/mcp"
+      timeout_sec: 120
+
+log:
+  level: "debug"
+  pretty: true
