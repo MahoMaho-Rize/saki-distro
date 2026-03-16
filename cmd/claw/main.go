@@ -1,6 +1,6 @@
 // claw is a CLI for interacting with the TAG Gateway-based coding agent.
 // It provides multi-turn conversation with automatic session management,
-// SSE streaming output, and standard OpenAI-compatible API communication.
+// SSE streaming output, and real-time agent execution tree rendering.
 //
 // Usage:
 //
@@ -31,31 +31,26 @@ func main() {
 	interactive := flag.Bool("i", false, "interactive mode (multi-turn REPL)")
 	flag.Parse()
 
-	// Session key: use provided, env, or generate.
 	sessionKey := *session
 	if sessionKey == "" {
 		sessionKey = fmt.Sprintf("claw-%d", time.Now().UnixNano()%1000000)
 	}
 
-	// Get message from args, stdin, or enter interactive mode.
 	message := strings.Join(flag.Args(), " ")
 
 	if *interactive || message == "" {
 		if message != "" {
-			// Run first message, then enter REPL.
 			runTurn(*endpoint, *model, sessionKey, *system, message)
 		}
 		repl(*endpoint, *model, sessionKey, *system)
 		return
 	}
 
-	// Single-shot mode.
 	if !runTurn(*endpoint, *model, sessionKey, *system, message) {
 		os.Exit(1)
 	}
 }
 
-// repl runs an interactive multi-turn conversation loop.
 func repl(endpoint, model, sessionKey, system string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Fprintf(os.Stderr, "claw session: %s (ctrl-d to exit)\n", sessionKey)
@@ -77,7 +72,6 @@ func repl(endpoint, model, sessionKey, system string) {
 	fmt.Fprintln(os.Stderr, "\nbye")
 }
 
-// runTurn sends one message and streams the response.
 func runTurn(endpoint, model, sessionKey, system, message string) bool {
 	messages := []map[string]string{
 		{"role": "user", "content": message},
@@ -128,19 +122,54 @@ func runTurn(endpoint, model, sessionKey, system, message string) bool {
 	return streamSSE(resp.Body)
 }
 
-// streamSSE reads SSE frames and prints content deltas to stdout.
+// ─── SSE Stream Processing with Trace Event Rendering ────────────────────────
+
+// traceEvent mirrors the kernel's stream.TraceEvent for JSON parsing.
+type traceEvent struct {
+	Trace      string `json:"trace"`
+	Tool       string `json:"tool,omitempty"`
+	Args       string `json:"args,omitempty"`
+	Result     string `json:"result,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	ExitCode   int    `json:"exit_code,omitempty"`
+	Depth      int    `json:"depth,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// treeState tracks the current execution tree for rendering.
+type treeState struct {
+	depth   int
+	toolIdx int
+	started time.Time
+}
+
+func newTreeState() *treeState {
+	return &treeState{started: time.Now()}
+}
+
+// streamSSE reads SSE frames, renders content deltas to stdout,
+// and renders trace events (SSE comments) as an execution tree on stderr.
 func streamSSE(body io.Reader) bool {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	tree := newTreeState()
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Trace events: SSE comment lines starting with ": {"
+		if strings.HasPrefix(line, ": {") {
+			handleTraceEvent(line[2:], tree) // strip ": " prefix
+			continue
+		}
+
+		// Content: SSE data lines
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
-			fmt.Println()
+			renderDone(tree)
 			return true
 		}
 
@@ -152,11 +181,9 @@ func streamSSE(body io.Reader) bool {
 				} `json:"delta"`
 			} `json:"choices"`
 		}
-
 		if err := json.Unmarshal([]byte(data), &frame); err != nil {
-			continue // skip malformed frames (e.g., truncated hijack frames)
+			continue
 		}
-
 		if len(frame.Choices) > 0 && frame.Choices[0].Delta.Content != "" {
 			fmt.Print(frame.Choices[0].Delta.Content)
 		}
@@ -168,6 +195,101 @@ func streamSSE(body io.Reader) bool {
 	}
 	fmt.Println()
 	return true
+}
+
+func handleTraceEvent(data string, tree *treeState) {
+	var ev traceEvent
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		return
+	}
+
+	prefix := treePrefix(tree.depth)
+
+	switch ev.Trace {
+	case "tool_start":
+		tree.toolIdx++
+		args := ev.Args
+		if len(args) > 60 {
+			args = args[:60] + "..."
+		}
+		fmt.Fprintf(os.Stderr, "%s├── ⚙ %s", prefix, ev.Tool)
+		if args != "" {
+			fmt.Fprintf(os.Stderr, " (%s)", compactArgs(args))
+		}
+		fmt.Fprintln(os.Stderr)
+
+	case "tool_end":
+		if ev.Error != "" {
+			fmt.Fprintf(os.Stderr, "%s│   ✗ error: %s (%dms)\n", prefix, truncStr(ev.Error, 60), ev.DurationMs)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s│   ✓ done (%dms)\n", prefix, ev.DurationMs)
+		}
+
+	case "delegate_start":
+		tree.depth++
+		args := ev.Args
+		if len(args) > 80 {
+			args = args[:80] + "..."
+		}
+		fmt.Fprintf(os.Stderr, "%s├── ⚡ delegate_task\n", prefix)
+		fmt.Fprintf(os.Stderr, "%s│   → %s\n", prefix, compactArgs(args))
+
+	case "delegate_end":
+		if ev.Error != "" {
+			fmt.Fprintf(os.Stderr, "%s│   ✗ sub-agent failed: %s (%dms)\n", prefix, truncStr(ev.Error, 50), ev.DurationMs)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s│   ✓ sub-agent done (%dms)\n", prefix, ev.DurationMs)
+		}
+		if tree.depth > 0 {
+			tree.depth--
+		}
+	}
+}
+
+func renderDone(tree *treeState) {
+	elapsed := time.Since(tree.started)
+	fmt.Println() // newline after content
+	if tree.toolIdx > 0 {
+		fmt.Fprintf(os.Stderr, "└── done (%d tools, %s)\n", tree.toolIdx, formatDuration(elapsed))
+	}
+}
+
+func treePrefix(depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	return strings.Repeat("│   ", depth)
+}
+
+func compactArgs(args string) string {
+	// Try to extract readable summary from JSON args
+	args = strings.TrimSpace(args)
+	if len(args) > 2 && args[0] == '{' {
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(args), &m) == nil {
+			// Show first string value as summary
+			for _, v := range m {
+				if s, ok := v.(string); ok && len(s) > 0 {
+					return truncStr(s, 60)
+				}
+			}
+		}
+	}
+	return truncStr(args, 60)
+}
+
+func truncStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
 func envOr(key, fallback string) string {
