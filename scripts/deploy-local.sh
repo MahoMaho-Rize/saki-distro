@@ -86,6 +86,7 @@ mcp:
       transport: http
       url: "http://127.0.0.1:${EXEC_PORT}/mcp"
       timeout_sec: 120
+$(if [[ "${CLAW_FLAVOR:-full}" == "full" ]]; then cat <<EXT
     - name: web
       transport: http
       url: "http://127.0.0.1:${WEB_PORT}/mcp"
@@ -94,6 +95,8 @@ mcp:
       transport: http
       url: "http://127.0.0.1:${BROWSER_PORT}/mcp"
       timeout_sec: 60
+EXT
+fi)
 
 rag:
   enabled: ${CLAW_RAG_ENABLED:-false}
@@ -181,8 +184,16 @@ else
     echo "  exec runtime: docker (fallback)"
 fi
 start_service "claw-exec" env $EXEC_ENV "$PROJECT_DIR/bin/claw-exec"
-start_service "claw-web" env CLAW_WEB_ADDR=":${WEB_PORT}" "$PROJECT_DIR/bin/claw-web"
-start_service "claw-browser" env CLAW_BROWSER_ADDR=":${BROWSER_PORT}" "$PROJECT_DIR/bin/claw-browser"
+
+# Extended servers (skip in core/lite mode)
+FLAVOR="${CLAW_FLAVOR:-full}"
+if [[ "$FLAVOR" == "full" ]]; then
+    start_service "claw-web" env CLAW_WEB_ADDR=":${WEB_PORT}" "$PROJECT_DIR/bin/claw-web"
+    start_service "claw-browser" env CLAW_BROWSER_ADDR=":${BROWSER_PORT}" "$PROJECT_DIR/bin/claw-browser"
+else
+    echo "  claw-web:     skipped (flavor=$FLAVOR)"
+    echo "  claw-browser: skipped (flavor=$FLAVOR)"
+fi
 
 sleep 0.5
 
@@ -211,8 +222,10 @@ check_service() {
 
 check_service "claw-fs" "$FS_PORT"
 check_service "claw-exec" "$EXEC_PORT"
-check_service "claw-web" "$WEB_PORT"
-check_service "claw-browser" "$BROWSER_PORT"
+if [[ "${CLAW_FLAVOR:-full}" == "full" ]]; then
+    check_service "claw-web" "$WEB_PORT"
+    check_service "claw-browser" "$BROWSER_PORT"
+fi
 
 # TAG health check via a simple request
 if curl -s --max-time 5 "http://127.0.0.1:${TAG_PORT}/v1/chat/completions" \

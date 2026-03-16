@@ -1,17 +1,54 @@
 # ============================================================
 #  Claw Distro — Makefile
 # ============================================================
+#
+#  Distro flavors:
+#    make build       — full build (all 4 MCP servers + CLI + hooks)
+#    make build-core  — core only (fs + exec + CLI + hooks, no browser/web)
+#    make build-lite  — minimal (fs + exec only, no CLI/hooks)
+# ============================================================
 
-GOFLAGS := -trimpath
+GOFLAGS := -trimpath -ldflags '-s -w'
 
-.PHONY: build
-build: ## Build all binaries
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-fs ./cmd/claw-fs
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-exec ./cmd/claw-exec
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-web ./cmd/claw-web
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw-browser ./cmd/claw-browser
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/claw ./cmd/claw
-	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/context-mgr ./hooks/context-mgr
+# ── Core binaries (always included) ─────────────────────────
+
+CORE_BINS := bin/claw-fs bin/claw-exec
+
+bin/claw-fs: cmd/claw-fs/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/claw-fs
+
+bin/claw-exec: cmd/claw-exec/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/claw-exec
+
+# ── Extended binaries (optional) ─────────────────────────────
+
+EXT_BINS := bin/claw-web bin/claw-browser
+
+bin/claw-web: cmd/claw-web/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/claw-web
+
+bin/claw-browser: cmd/claw-browser/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/claw-browser
+
+# ── CLI + hooks ──────────────────────────────────────────────
+
+TOOL_BINS := bin/claw bin/context-mgr bin/tool-guard
+
+bin/claw: cmd/claw/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/claw
+
+bin/context-mgr: hooks/context-mgr/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./hooks/context-mgr
+
+bin/tool-guard: hooks/tool-guard/main.go
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./hooks/tool-guard
+
+# ── Distro flavors ───────────────────────────────────────────
+
+.PHONY: build build-core build-lite
+build: $(CORE_BINS) $(EXT_BINS) $(TOOL_BINS) ## Full build (all binaries)
+build-core: $(CORE_BINS) $(TOOL_BINS) ## Core: fs + exec + CLI + hooks (no browser/web)
+build-lite: $(CORE_BINS) ## Lite: fs + exec only (minimal)
 
 .PHONY: test
 test: ## Run all tests
