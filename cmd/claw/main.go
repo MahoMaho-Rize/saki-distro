@@ -258,6 +258,13 @@ func handleTraceEvent(data string, tree *treeState) {
 		if tree.depth > 0 {
 			tree.depth--
 		}
+
+	case "exec_output":
+		// Real-time stdout line from sandbox execution
+		line := ev.Result
+		if line != "" {
+			renderStderr("%s│   %s\n", prefix, truncStr(line, 120))
+		}
 	}
 }
 

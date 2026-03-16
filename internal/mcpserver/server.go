@@ -17,10 +17,11 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) *CallToolResult
 // Server is a minimal MCP Streamable HTTP server.
 // It handles initialize, tools/list, and tools/call over JSON-RPC 2.0.
 type Server struct {
-	info    ServerInfo
-	mu      sync.RWMutex
-	tools   []Tool
-	handler map[string]ToolHandler
+	info          ServerInfo
+	mu            sync.RWMutex
+	tools         []Tool
+	handler       map[string]ToolHandler
+	streamHandler map[string]StreamingToolHandler // tools with progress streaming
 }
 
 // New creates a new MCP server with the given name and version.
@@ -67,7 +68,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		s.handleToolsList(w, &req)
 	case "tools/call":
-		s.handleToolsCall(w, r, &req)
+		// Check for streaming handler first
+		var toolName string
+		var cp CallToolParams
+		if json.Unmarshal(req.Params, &cp) == nil {
+			toolName = cp.Name
+		}
+		s.mu.RLock()
+		sh, isStreaming := s.streamHandler[toolName]
+		s.mu.RUnlock()
+		if isStreaming {
+			s.handleStreamingToolsCall(w, r, &req, sh)
+		} else {
+			s.handleToolsCall(w, r, &req)
+		}
 	default:
 		writeRPCError(w, req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}

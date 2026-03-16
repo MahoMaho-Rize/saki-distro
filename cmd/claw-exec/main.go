@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -246,8 +247,31 @@ func dockerExec(ctx context.Context, command string, interactive bool) *exec.Cmd
 
 // ─── MCP tool registration ─────────────────────────────────────────
 
+// buildExecResult formats command exit code + stdout + stderr into a CallToolResult.
+func buildExecResult(err error, stdout, stderr string) *mcpserver.CallToolResult {
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if strings.Contains(err.Error(), "signal: killed") {
+			exitCode = 137
+		} else {
+			return mcpserver.ErrorResult(err.Error())
+		}
+	}
+
+	result := fmt.Sprintf("exit_code: %d\n", exitCode)
+	if stdout != "" {
+		result += "--- stdout ---\n" + stdout
+	}
+	if stderr != "" {
+		result += "--- stderr ---\n" + stderr
+	}
+	return mcpserver.SuccessResult(result)
+}
+
 func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
-	srv.AddTool(mcpserver.Tool{
+	srv.AddStreamingTool(mcpserver.Tool{
 		Name:        "exec",
 		Description: "Execute a shell command in the sandbox. pip/npm installs persist across calls.",
 		InputSchema: jsonSchema(map[string]any{
@@ -258,7 +282,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 				"timeout_ms": map[string]any{"type": "integer", "description": "Timeout ms (default 30000, max 300000)"},
 			},
 		}),
-	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
+	}, func(ctx context.Context, args json.RawMessage, pw *mcpserver.ProgressWriter) *mcpserver.CallToolResult {
 		var p struct {
 			Command   string `json:"command"`
 			TimeoutMs int    `json:"timeout_ms"`
@@ -279,30 +303,41 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 		defer cancel()
 
 		cmd := sandboxExec(execCtx, ws.Root(), p.Command, false)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &limitedWriter{w: &stdout, limit: maxOutputBytes}
+
+		// Streaming stdout: pipe stdout for line-by-line progress,
+		// collect stderr in a buffer (usually small, error messages).
+		var stderr bytes.Buffer
+		var stdout bytes.Buffer
 		cmd.Stderr = &limitedWriter{w: &stderr, limit: maxOutputBytes}
 
-		err := cmd.Run()
-		exitCode := 0
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
-			} else if strings.Contains(err.Error(), "signal: killed") {
-				exitCode = 137
-			} else {
-				return mcpserver.ErrorResult(err.Error())
+		stdoutPipe, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil || pw == nil {
+			// Fallback: non-streaming execution
+			cmd.Stdout = &limitedWriter{w: &stdout, limit: maxOutputBytes}
+			err := cmd.Run()
+			return buildExecResult(err, stdout.String(), stderr.String())
+		}
+
+		if err := cmd.Start(); err != nil {
+			return mcpserver.ErrorResult(err.Error())
+		}
+
+		// Stream stdout line by line as progress notifications
+		scanner := bufio.NewScanner(stdoutPipe)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxOutputBytes)
+		lineCount := 0
+		for scanner.Scan() {
+			line := scanner.Text()
+			stdout.WriteString(line + "\n")
+			lineCount++
+			// Rate limit: send progress every line (up to a sane limit)
+			if lineCount <= 200 {
+				pw.WriteLine(line)
 			}
 		}
 
-		result := fmt.Sprintf("exit_code: %d\n", exitCode)
-		if stdout.Len() > 0 {
-			result += "--- stdout ---\n" + stdout.String()
-		}
-		if stderr.Len() > 0 {
-			result += "--- stderr ---\n" + stderr.String()
-		}
-		return mcpserver.SuccessResult(result)
+		err := cmd.Wait()
+		return buildExecResult(err, stdout.String(), stderr.String())
 	})
 
 	srv.AddTool(mcpserver.Tool{
