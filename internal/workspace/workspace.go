@@ -253,6 +253,12 @@ func (w *W) resolveIn(root, path string) (string, error) {
 		return root, nil
 	}
 
+	// Null byte rejection: C's open() truncates at \x00, which can
+	// cause path traversal via "/workspace/\x00/../etc/passwd" → "/workspace/".
+	if strings.ContainsRune(path, '\x00') {
+		return "", fmt.Errorf("workspace: null byte in path")
+	}
+
 	var abs string
 	if filepath.IsAbs(path) {
 		abs = filepath.Clean(path)

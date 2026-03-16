@@ -113,8 +113,8 @@ func (h *toolGuardHook) Process(_ context.Context, params *hooklib.ProcessParams
 			continue
 		}
 
-		// Normalize Unicode homoglyphs + strip zero-width chars (all messages)
-		normalized := safenet.NormalizeHomoglyphs(content)
+		// NFC normalize + homoglyph replacement + zero-width stripping (all messages)
+		normalized := safenet.NormalizeUnicode(content)
 		if normalized != content {
 			m["content"] = normalized
 			content = normalized

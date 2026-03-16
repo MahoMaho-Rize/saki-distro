@@ -7,6 +7,7 @@ replace tag-gateway => /home/agent/Edge-Agent
 require (
 	github.com/chromedp/cdproto v0.0.0-20250803210736-d308e07a266d
 	github.com/chromedp/chromedp v0.14.2
+	golang.org/x/text v0.35.0
 	tag-gateway v0.0.0-00010101000000-000000000000
 )
 
