@@ -24,6 +24,7 @@ import (
 	"github.com/chromedp/chromedp"
 
 	"claw-distro/internal/mcpserver"
+	"claw-distro/internal/safenet"
 )
 
 const (
@@ -135,6 +136,11 @@ func registerTools(srv *mcpserver.Server, b *browser) {
 		}
 		if p.URL == "" {
 			return mcpserver.ErrorResult("url is required")
+		}
+
+		// SSRF guard: block navigation to internal IPs / metadata endpoints
+		if err := safenet.ValidateFetchURL(p.URL); err != nil {
+			return mcpserver.ErrorResult("blocked: " + err.Error())
 		}
 
 		actions := []chromedp.Action{
