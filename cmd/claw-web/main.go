@@ -17,6 +17,7 @@ import (
 	"regexp"
 
 	"claw-distro/internal/mcpserver"
+	"claw-distro/internal/safenet"
 )
 
 const (
@@ -93,13 +94,11 @@ func handleWebFetch(_ context.Context, args json.RawMessage) *mcpserver.CallTool
 		return mcpserver.ErrorResult("url is required")
 	}
 
-	// Validate URL scheme.
-	parsed, err := url.Parse(p.URL)
-	if err != nil {
-		return mcpserver.ErrorResult("invalid url: " + err.Error())
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return mcpserver.ErrorResult("only http/https URLs are supported")
+	// SSRF prevention: block private IPs, metadata endpoints, DNS rebinding
+	if os.Getenv("CLAW_WEB_DISABLE_SSRF_CHECK") != "1" {
+		if err := safenet.ValidateFetchURL(p.URL); err != nil {
+			return mcpserver.ErrorResult("blocked: " + err.Error())
+		}
 	}
 
 	req, err := http.NewRequest(http.MethodGet, p.URL, nil)

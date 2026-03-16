@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 
+	"claw-distro/internal/safenet"
 	"tag-gateway/hooklib"
 )
 
@@ -108,15 +109,37 @@ func (h *toolGuardHook) Process(_ context.Context, params *hooklib.ProcessParams
 		role, _ := m["role"].(string)
 		content, _ := m["content"].(string)
 
-		if role != "user" || content == "" {
+		if content == "" {
 			continue
 		}
 
-		// Check for prompt injection patterns
+		// Normalize Unicode homoglyphs + strip zero-width chars (all messages)
+		normalized := safenet.NormalizeHomoglyphs(content)
+		if normalized != content {
+			m["content"] = normalized
+			content = normalized
+			messages[i] = m
+			modified = true
+		}
+
+		// Redact credentials in tool results (assistant messages)
+		if role == "assistant" || role == "tool" {
+			redacted := safenet.RedactSecrets(content)
+			if redacted != content {
+				m["content"] = redacted
+				messages[i] = m
+				modified = true
+			}
+			continue
+		}
+
+		if role != "user" {
+			continue
+		}
+
+		// Check for prompt injection patterns (user messages only)
 		for _, pat := range suspiciousPatterns {
 			if pat.MatchString(content) {
-				// Wrap the suspicious content with boundary markers
-				// (random ID makes it harder to spoof the marker)
 				boundaryID := fmt.Sprintf("%x", i*31337+len(content))
 				wrapped := fmt.Sprintf(
 					"<<<EXTERNAL_UNTRUSTED_CONTENT id=\"%s\">>>\n%s\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\"%s\">>>",
@@ -126,6 +149,17 @@ func (h *toolGuardHook) Process(_ context.Context, params *hooklib.ProcessParams
 				modified = true
 				break
 			}
+		}
+
+		// Check for command obfuscation in user messages
+		if reason := safenet.DetectObfuscation(content); reason != "" {
+			boundaryID := fmt.Sprintf("obf-%x", i*31337+len(content))
+			wrapped := fmt.Sprintf(
+				"<<<EXTERNAL_UNTRUSTED_CONTENT id=\"%s\" reason=\"%s\">>>\n%s\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\"%s\">>>",
+				boundaryID, reason, content, boundaryID)
+			m["content"] = wrapped
+			messages[i] = m
+			modified = true
 		}
 	}
 

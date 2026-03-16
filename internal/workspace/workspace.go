@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // DefaultRoot is the default workspace root inside containers.
@@ -290,6 +291,15 @@ func (w *W) resolveIn(root, path string) (string, error) {
 	base := filepath.Base(resolved)
 	if w.blacklist[base] {
 		return "", fmt.Errorf("workspace: access denied: %s", base)
+	}
+
+	// Hardlink escape detection: nlink > 1 means the file has multiple
+	// directory entries. An attacker could hardlink a file outside the
+	// workspace to a path inside it, bypassing path-based checks.
+	if info, statErr := os.Lstat(resolved); statErr == nil && info.Mode().IsRegular() {
+		if sys, ok := info.Sys().(*syscall.Stat_t); ok && sys.Nlink > 1 {
+			return "", fmt.Errorf("workspace: hardlink detected (nlink=%d): %s", sys.Nlink, path)
+		}
 	}
 
 	return resolved, nil
