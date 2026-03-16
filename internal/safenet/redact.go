@@ -3,6 +3,8 @@ package safenet
 import (
 	"regexp"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // credentialPatterns matches common credential formats in tool output.
@@ -88,9 +90,18 @@ func DetectObfuscation(cmd string) string {
 
 // --- Unicode homoglyph normalization ---
 
-// NormalizeHomoglyphs strips zero-width characters and normalizes
+// NormalizeUnicode applies NFC normalization + homoglyph replacement +
+// zero-width stripping. NFC normalization prevents composed vs decomposed
+// character differences from bypassing pattern matching (e.g., é as
+// U+00E9 vs U+0065+U+0301).
+func NormalizeUnicode(text string) string {
+	text = norm.NFC.String(text)
+	return normalizeHomoglyphs(text)
+}
+
+// normalizeHomoglyphs strips zero-width characters and normalizes
 // common Unicode homoglyphs that can be used to disguise prompt injection.
-func NormalizeHomoglyphs(text string) string {
+func normalizeHomoglyphs(text string) string {
 	var b strings.Builder
 	b.Grow(len(text))
 	for _, r := range text {
