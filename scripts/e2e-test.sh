@@ -118,7 +118,7 @@ chat() {
         -H "Content-Type: application/json" \
         -H "X-Session-Key: e2e-test-session" \
         -d "$(jq -n --arg msg "$message" '{
-            model: "claude-sonnet-4-20250514",
+            model: "claude-sonnet-4-6",
             stream: true,
             messages: [{role: "system", content: "You are a coding agent. Be concise."},
                        {role: "user", content: $msg}]
@@ -145,8 +145,13 @@ CLAW_WORKSPACE="$UPPER_DIR" CLAW_HOST_PROJECT="$HOST_PROJECT" CLAW_FS_ADDR=":${F
     "$PROJECT_DIR/bin/claw-fs" > /dev/null 2>&1 &
 PIDS+=($!)
 
-CLAW_WORKSPACE="$UPPER_DIR" CLAW_EXEC_ADDR=":${EXEC_PORT}" \
-    "$PROJECT_DIR/bin/claw-exec" > /dev/null 2>&1 &
+# claw-exec: prefer bwrap+rootfs, fallback to docker
+EXEC_ENV="CLAW_WORKSPACE=$UPPER_DIR CLAW_EXEC_ADDR=:${EXEC_PORT} CLAW_DATA_DIR=$UPPER_DIR"
+ROOTFS_CHECK="$PROJECT_DIR/.data/rootfs"
+if which bwrap > /dev/null 2>&1 && [[ -d "$ROOTFS_CHECK/usr" ]]; then
+    EXEC_ENV="$EXEC_ENV CLAW_EXEC_RUNTIME=bwrap CLAW_EXEC_ROOTFS=$ROOTFS_CHECK"
+fi
+env $EXEC_ENV "$PROJECT_DIR/bin/claw-exec" > /dev/null 2>&1 &
 PIDS+=($!)
 
 CLAW_WEB_ADDR=":${WEB_PORT}" \
@@ -162,12 +167,15 @@ max_react_iterations: 10
 sse_keepalive_ms: 15000
 providers:
   - name: anthropic
-    base_url: "http://192.168.190.105:8088/api"
-    api_key: "\${ANTHROPIC_AUTH_TOKEN}"
+    base_url: "${ANTHROPIC_BASE_URL:-http://192.168.190.105:8088/api}"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
     models:
-      - name: "claude-sonnet-4-20250514"
+      - name: "claude-sonnet-4-6"
         context_window: 200000
         max_output_tokens: 16384
+      - name: "claude-opus-4-6"
+        context_window: 1000000
+        max_output_tokens: 128000
 mcp:
   inject_mode: "auto"
   servers:
@@ -376,12 +384,12 @@ echo "=== 11. Tool Discovery ==="
 TOOL_COUNT=$(grep -o "injected tools" /tmp/tagd-e2e.log | head -1)
 TOOL_NUM=$(grep "injected tools" /tmp/tagd-e2e.log | head -1 | grep -o '"tools":[0-9]*' | grep -o '[0-9]*')
 if [[ -n "$TOOL_NUM" ]]; then
-    assert_ge "TAG discovered tools" "$TOOL_NUM" 12
+    assert_ge "TAG discovered tools" "$TOOL_NUM" 13
 else
     # Try alternate log format
     TOOL_NUM=$(grep "injected tools" /tmp/tagd-e2e.log | head -1 | grep -oP 'tools.*?(\d+)' | grep -oP '\d+' | head -1)
     if [[ -n "$TOOL_NUM" ]]; then
-        assert_ge "TAG discovered tools" "$TOOL_NUM" 12
+        assert_ge "TAG discovered tools" "$TOOL_NUM" 13
     else
         TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
         printf "  \033[32m✓\033[0m tools injected (log format check skipped)\n"
@@ -395,7 +403,7 @@ echo ""
 # ============================================================
 echo "=== 12. CLI ==="
 
-CLI_OUT=$("$PROJECT_DIR/bin/claw" -endpoint "http://127.0.0.1:${TAG_PORT}/v1/chat/completions" "Say exactly: cli_e2e_pass" 2>&1)
+CLI_OUT=$("$PROJECT_DIR/bin/claw" -endpoint "http://127.0.0.1:${TAG_PORT}/v1/chat/completions" -model "claude-sonnet-4-6" "Say exactly: cli_e2e_pass" 2>&1)
 assert_contains "CLI streaming output" "$CLI_OUT" "cli_e2e_pass"
 
 echo ""
