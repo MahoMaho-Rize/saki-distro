@@ -26,6 +26,10 @@ BROWSER_PORT=9103
 # --- Stop command ---
 if [[ "${1:-}" == "stop" ]]; then
     echo "Stopping Saki services..."
+    # Stop persistent sandbox container
+    if docker rm -f saki-sandbox 2>/dev/null; then
+        echo "  stopped saki-sandbox container"
+    fi
     for f in "$PID_DIR"/*.pid; do
         [[ -f "$f" ]] || continue
         pid=$(cat "$f")

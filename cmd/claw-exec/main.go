@@ -1,7 +1,12 @@
 // claw-exec is an MCP Server that provides shell execution tools.
-// All commands run inside Docker containers with workspace volume mount.
-// The MCP server itself runs on the host; it spawns Docker containers
-// for each command execution.
+// Commands run inside a persistent Docker container (saki-sandbox).
+// The container idles with `tail -f /dev/null`; claw-exec sends
+// commands via `docker exec`.
+//
+// Persistent container advantages over per-command `docker run`:
+//   - pip install / npm install state persists across tool calls
+//   - No container startup overhead per command (~0ms vs ~716ms)
+//   - Agent can install tools and use them immediately
 package main
 
 import (
@@ -14,7 +19,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"claw-distro/internal/mcpserver"
@@ -28,17 +32,16 @@ const (
 	maxProcessCount = 32
 )
 
-// Container configuration
 var (
-	containerImage = envOr("CLAW_EXEC_IMAGE", "ubuntu:24.04")
-	containerMem   = envOr("CLAW_EXEC_MEMORY", "512m")
-	containerCPU   = envOr("CLAW_EXEC_CPUS", "2")
-	containerPids  = envOr("CLAW_EXEC_PIDS", "100")
-	networkMode    = envOr("CLAW_EXEC_NETWORK", "bridge") // bridge for pip/npm; "none" for full isolation
-	containerSeq   int64
+	sandboxImage = envOr("CLAW_EXEC_IMAGE", "saki-sandbox:latest")
+	sandboxName  = envOr("CLAW_EXEC_CONTAINER", "saki-sandbox")
+	networkMode  = envOr("CLAW_EXEC_NETWORK", "bridge")
+	memoryLimit  = envOr("CLAW_EXEC_MEMORY", "512m")
+	cpuLimit     = envOr("CLAW_EXEC_CPUS", "2")
+	pidsLimit    = envOr("CLAW_EXEC_PIDS", "100")
 )
 
-// Proxy env vars to pass into containers
+// proxyEnvVars to pass into the container at creation time.
 var proxyEnvVars []string
 
 func init() {
@@ -49,15 +52,14 @@ func init() {
 	}
 }
 
-// processEntry tracks a background container.
+// processEntry tracks a background `docker exec` process.
 type processEntry struct {
-	containerName string
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	outBuf        *limitedBuffer
-	errBuf        *limitedBuffer
-	done          chan struct{}
-	exitCode      int
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	outBuf   *limitedBuffer
+	errBuf   *limitedBuffer
+	done     chan struct{}
+	exitCode int
 }
 
 type processTable struct {
@@ -77,9 +79,8 @@ func (pt *processTable) add(e *processEntry) (int, error) {
 		return 0, fmt.Errorf("process limit reached (%d)", maxProcessCount)
 	}
 	pt.nextID++
-	id := pt.nextID
-	pt.entries[id] = e
-	return id, nil
+	pt.entries[pt.nextID] = e
+	return pt.nextID, nil
 }
 
 func (pt *processTable) get(id int) (*processEntry, bool) {
@@ -92,11 +93,6 @@ func (pt *processTable) get(id int) (*processEntry, bool) {
 func (pt *processTable) remove(id int) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
-	if e, ok := pt.entries[id]; ok {
-		// Cleanup container
-		cleanup := exec.Command("docker", "rm", "-f", e.containerName)
-		_ = cleanup.Run()
-	}
 	delete(pt.entries, id)
 }
 
@@ -113,7 +109,13 @@ func main() {
 	ws := workspace.New(root)
 	pt := newProcessTable()
 
-	srv := mcpserver.New("claw-exec", "0.2.0")
+	// Ensure persistent sandbox container is running.
+	if err := ensureSandbox(ws.Root()); err != nil {
+		fmt.Fprintf(os.Stderr, "claw-exec: sandbox setup failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	srv := mcpserver.New("claw-exec", "0.3.0")
 	registerTools(srv, ws, pt)
 
 	if err := srv.ListenAndServe(addr); err != nil {
@@ -122,48 +124,70 @@ func main() {
 	}
 }
 
-// buildDockerArgs constructs the common docker run arguments.
-func buildDockerArgs(containerName, workDir string, timeout time.Duration) []string {
+// ensureSandbox creates or starts the persistent sandbox container.
+func ensureSandbox(workDir string) error {
+	// Check if container already exists and is running.
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", sandboxName).Output()
+	if err == nil && strings.TrimSpace(string(out)) == "true" {
+		fmt.Fprintf(os.Stderr, "claw-exec: sandbox %s already running\n", sandboxName)
+		return nil
+	}
+
+	// Remove stale container.
+	_ = exec.Command("docker", "rm", "-f", sandboxName).Run()
+
+	// Create persistent container.
 	args := []string{
-		"run", "--rm",
-		"--name", containerName,
+		"run", "-d",
+		"--name", sandboxName,
 		"--network", networkMode,
-		"--memory", containerMem,
-		"--cpus", containerCPU,
-		"--pids-limit", containerPids,
+		"--memory", memoryLimit,
+		"--cpus", cpuLimit,
+		"--pids-limit", pidsLimit,
 		"--security-opt", "no-new-privileges",
 		"-v", workDir + ":/workspace",
 		"-w", "/workspace",
 	}
-	// Pass proxy env vars into container
 	for _, env := range proxyEnvVars {
 		args = append(args, "-e", env)
 	}
-	return args
+	args = append(args, sandboxImage)
+
+	cmd := exec.Command("docker", args...)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker run: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "claw-exec: sandbox %s started (image: %s)\n", sandboxName, sandboxImage)
+	return nil
 }
 
-func nextContainerName() string {
-	return fmt.Sprintf("saki-exec-%d-%d", os.Getpid(), atomic.AddInt64(&containerSeq, 1))
+// dockerExec builds a `docker exec` command for the persistent sandbox.
+func dockerExec(ctx context.Context, command string, interactive bool) *exec.Cmd {
+	args := []string{"exec"}
+	if interactive {
+		args = append(args, "-i")
+	}
+	args = append(args, sandboxName, "sh", "-c", command)
+	return exec.CommandContext(ctx, "docker", args...)
 }
 
-func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
+func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 	srv.AddTool(mcpserver.Tool{
 		Name:        "exec",
-		Description: "Execute a shell command in an isolated Docker container. Returns stdout, stderr, and exit code.",
+		Description: "Execute a shell command in the persistent sandbox. pip/npm installs persist across calls.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"command"},
 			"properties": map[string]any{
-				"command":     map[string]any{"type": "string", "description": "Shell command to execute"},
-				"timeout_ms":  map[string]any{"type": "integer", "description": "Timeout in milliseconds (default 30000, max 300000)"},
-				"working_dir": map[string]any{"type": "string", "description": "Working directory relative to workspace"},
+				"command":    map[string]any{"type": "string", "description": "Shell command to execute"},
+				"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 30000, max 300000)"},
 			},
 		}),
 	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
 		var p struct {
-			Command    string `json:"command"`
-			TimeoutMs  int    `json:"timeout_ms"`
-			WorkingDir string `json:"working_dir"`
+			Command   string `json:"command"`
+			TimeoutMs int    `json:"timeout_ms"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
@@ -177,22 +201,10 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			}
 		}
 
-		containerName := nextContainerName()
-		dockerArgs := buildDockerArgs(containerName, ws.Root(), timeout)
-		dockerArgs = append(dockerArgs, containerImage, "sh", "-c", p.Command)
-
 		execCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		// Zombie cleanup
-		go func() {
-			<-execCtx.Done()
-			killCmd := exec.Command("docker", "kill", containerName)
-			_ = killCmd.Run()
-		}()
-
-		cmd := exec.CommandContext(execCtx, "docker", dockerArgs...)
-
+		cmd := dockerExec(execCtx, p.Command, false)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &limitedWriter{w: &stdout, limit: maxOutputBytes}
 		cmd.Stderr = &limitedWriter{w: &stderr, limit: maxOutputBytes}
@@ -203,7 +215,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else if strings.Contains(err.Error(), "signal: killed") {
-				exitCode = 137 // SIGKILL from timeout
+				exitCode = 137
 			} else {
 				return mcpserver.ErrorResult(err.Error())
 			}
@@ -221,7 +233,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 	srv.AddTool(mcpserver.Tool{
 		Name:        "process_start",
-		Description: "Start a long-running background process in a Docker container. Returns a process ID for send/poll.",
+		Description: "Start a long-running background process in the sandbox.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"command"},
@@ -237,12 +249,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		containerName := nextContainerName()
-		dockerArgs := buildDockerArgs(containerName, ws.Root(), maxTimeout)
-		dockerArgs = append(dockerArgs, "-i", containerImage, "sh", "-c", p.Command)
-
-		cmd := exec.Command("docker", dockerArgs...)
-
+		cmd := dockerExec(context.Background(), p.Command, true)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
@@ -257,18 +264,10 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		entry := &processEntry{
-			containerName: containerName,
-			cmd:           cmd,
-			stdin:         stdin,
-			outBuf:        outBuf,
-			errBuf:        errBuf,
-			done:          make(chan struct{}),
-		}
+		entry := &processEntry{cmd: cmd, stdin: stdin, outBuf: outBuf, errBuf: errBuf, done: make(chan struct{})}
 		id, err := pt.add(entry)
 		if err != nil {
 			_ = cmd.Process.Kill()
-			_ = exec.Command("docker", "rm", "-f", containerName).Run()
 			return mcpserver.ErrorResult(err.Error())
 		}
 
@@ -285,16 +284,16 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 	srv.AddTool(mcpserver.Tool{
 		Name:        "process_send",
-		Description: "Send input text to a background process's stdin.",
+		Description: "Send input to a background process's stdin.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"pid", "input"},
 			"properties": map[string]any{
-				"pid":   map[string]any{"type": "integer", "description": "Process ID from process_start"},
-				"input": map[string]any{"type": "string", "description": "Text to write to stdin"},
+				"pid":   map[string]any{"type": "integer"},
+				"input": map[string]any{"type": "string"},
 			},
 		}),
-	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
+	}, func(_ context.Context, args json.RawMessage) *mcpserver.CallToolResult {
 		var p struct {
 			PID   int    `json:"pid"`
 			Input string `json:"input"`
@@ -302,12 +301,10 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 		if err := json.Unmarshal(args, &p); err != nil {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
-
 		entry, ok := pt.get(p.PID)
 		if !ok {
 			return mcpserver.ErrorResult(fmt.Sprintf("no process with pid %d", p.PID))
 		}
-
 		if _, err := entry.stdin.Write([]byte(p.Input)); err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
@@ -316,22 +313,21 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 	srv.AddTool(mcpserver.Tool{
 		Name:        "process_poll",
-		Description: "Read new output from a background process and check if it's still running.",
+		Description: "Read output from a background process and check if still running.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"pid"},
 			"properties": map[string]any{
-				"pid": map[string]any{"type": "integer", "description": "Process ID from process_start"},
+				"pid": map[string]any{"type": "integer"},
 			},
 		}),
-	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
+	}, func(_ context.Context, args json.RawMessage) *mcpserver.CallToolResult {
 		var p struct {
 			PID int `json:"pid"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
-
 		entry, ok := pt.get(p.PID)
 		if !ok {
 			return mcpserver.ErrorResult(fmt.Sprintf("no process with pid %d", p.PID))
@@ -346,7 +342,6 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 
 		stdout := entry.outBuf.Drain()
 		stderr := entry.errBuf.Drain()
-
 		var buf bytes.Buffer
 		fmt.Fprintf(&buf, "running: %v\n", running)
 		if len(stdout) > 0 {
@@ -355,12 +350,10 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 		if len(stderr) > 0 {
 			fmt.Fprintf(&buf, "--- stderr ---\n%s", stderr)
 		}
-
 		if !running {
 			fmt.Fprintf(&buf, "exit_code: %d\n", entry.exitCode)
 			pt.remove(p.PID)
 		}
-
 		return mcpserver.SuccessResult(buf.String())
 	})
 }

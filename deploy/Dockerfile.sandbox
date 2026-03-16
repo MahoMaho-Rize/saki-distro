@@ -1,0 +1,48 @@
+# Saki Agent Sandbox — Persistent Container Image
+#
+# slim-bookworm (glibc) over alpine (musl): pip install numpy/pandas
+# needs glibc, musl requires source compilation (slow + fragile).
+#
+# This container runs as a persistent sandbox. The MCP server (claw-exec)
+# sends commands via `docker exec`. The container idles with `tail -f /dev/null`.
+
+FROM python:3.11-slim-bookworm
+
+# Non-interactive: prevent apt/pip from blocking on prompts.
+# Agent must never see "Do you want to continue? [Y/n]".
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Use Aliyun mirror for faster downloads in CN.
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; true
+
+# Core toolchain — everything an agent needs for coding tasks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Network & download
+    curl wget ca-certificates \
+    # Version control
+    git \
+    # Data processing (jq = agent's JSON swiss army knife)
+    jq \
+    # Archive handling
+    tar unzip \
+    # Build essentials (prevents "gcc not found" during pip install)
+    build-essential \
+    # Node.js (via nodesource would be better, but this is the minimal path)
+    nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user — agent code runs as unprivileged `agent` user.
+RUN useradd -m -s /bin/bash agent
+
+# Workspace mount point — host directory bind-mounted here at runtime.
+WORKDIR /workspace
+RUN chown -R agent:agent /workspace
+
+# Drop to unprivileged user.
+USER agent
+
+# Idle forever — claw-exec sends commands via `docker exec`.
+CMD ["tail", "-f", "/dev/null"]
