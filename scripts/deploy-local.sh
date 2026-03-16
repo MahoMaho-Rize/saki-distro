@@ -134,9 +134,27 @@ env $FS_ENV "$PROJECT_DIR/bin/claw-fs" > "$DATA_DIR/claw-fs.log" 2>&1 &
 echo "$!" > "$PID_DIR/claw-fs.pid"
 echo "  starting claw-fs... pid=$!"
 
-start_service "claw-exec" env CLAW_WORKSPACE="$WORKSPACE" CLAW_EXEC_ADDR=":${EXEC_PORT}" \
-    HTTP_PROXY="socks5h://127.0.0.1:1080" HTTPS_PROXY="socks5h://127.0.0.1:1080" ALL_PROXY="socks5h://127.0.0.1:1080" \
-    "$PROJECT_DIR/bin/claw-exec"
+# Sandbox runtime: bwrap (if rootfs exists) or docker (fallback)
+ROOTFS_DIR="$DATA_DIR/rootfs"
+if [[ ! -d "$ROOTFS_DIR/usr" ]]; then
+    echo "  exporting sandbox rootfs (one-time)..."
+    mkdir -p "$ROOTFS_DIR"
+    docker create --name saki-rootfs-export saki-sandbox:latest > /dev/null 2>&1
+    docker export saki-rootfs-export | tar -xf - -C "$ROOTFS_DIR" 2>/dev/null
+    docker rm saki-rootfs-export > /dev/null 2>&1
+    echo "  rootfs ready: $(du -sh "$ROOTFS_DIR" | cut -f1)"
+fi
+
+EXEC_ENV="CLAW_WORKSPACE=$WORKSPACE CLAW_EXEC_ADDR=:${EXEC_PORT} CLAW_DATA_DIR=$DATA_DIR"
+EXEC_ENV="$EXEC_ENV HTTP_PROXY=socks5h://127.0.0.1:1080 HTTPS_PROXY=socks5h://127.0.0.1:1080 ALL_PROXY=socks5h://127.0.0.1:1080"
+if which bwrap > /dev/null 2>&1 && [[ -d "$ROOTFS_DIR/usr" ]]; then
+    EXEC_ENV="$EXEC_ENV CLAW_EXEC_RUNTIME=bwrap CLAW_EXEC_ROOTFS=$ROOTFS_DIR"
+    echo "  exec runtime: bwrap + rootfs"
+else
+    EXEC_ENV="$EXEC_ENV CLAW_EXEC_RUNTIME=docker"
+    echo "  exec runtime: docker (fallback)"
+fi
+start_service "claw-exec" env $EXEC_ENV "$PROJECT_DIR/bin/claw-exec"
 start_service "claw-web" env CLAW_WEB_ADDR=":${WEB_PORT}" "$PROJECT_DIR/bin/claw-web"
 start_service "claw-browser" env CLAW_BROWSER_ADDR=":${BROWSER_PORT}" "$PROJECT_DIR/bin/claw-browser"
 
