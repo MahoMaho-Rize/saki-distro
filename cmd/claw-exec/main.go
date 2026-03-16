@@ -1,12 +1,11 @@
 // claw-exec is an MCP Server that provides shell execution tools.
-// Commands run inside a persistent Docker container (saki-sandbox).
-// The container idles with `tail -f /dev/null`; claw-exec sends
-// commands via `docker exec`.
 //
-// Persistent container advantages over per-command `docker run`:
-//   - pip install / npm install state persists across tool calls
-//   - No container startup overhead per command (~0ms vs ~716ms)
-//   - Agent can install tools and use them immediately
+// Two runtime modes (auto-detected, or set via CLAW_EXEC_RUNTIME):
+//
+//	bwrap:  bubblewrap sandbox using exported Docker rootfs.
+//	        8ms startup, zero daemon, pip persists via home dir bind.
+//	docker: persistent Docker container (fallback when bwrap unavailable).
+//	        docker exec into saki-sandbox container.
 package main
 
 import (
@@ -26,22 +25,25 @@ import (
 )
 
 const (
-	maxOutputBytes  = 1 << 20 // 1MB per stream
+	maxOutputBytes  = 1 << 20
 	defaultTimeout  = 30 * time.Second
 	maxTimeout      = 300 * time.Second
 	maxProcessCount = 32
 )
 
+// Runtime configuration
 var (
+	runtime      string // "bwrap" or "docker"
+	rootfsDir    = envOr("CLAW_EXEC_ROOTFS", "/opt/saki-rootfs")
 	sandboxImage = envOr("CLAW_EXEC_IMAGE", "saki-sandbox:latest")
 	sandboxName  = envOr("CLAW_EXEC_CONTAINER", "saki-sandbox")
 	networkMode  = envOr("CLAW_EXEC_NETWORK", "bridge")
 	memoryLimit  = envOr("CLAW_EXEC_MEMORY", "512m")
 	cpuLimit     = envOr("CLAW_EXEC_CPUS", "2")
 	pidsLimit    = envOr("CLAW_EXEC_PIDS", "100")
+	agentHome    string // persistent home directory for bwrap
 )
 
-// proxyEnvVars to pass into the container at creation time.
 var proxyEnvVars []string
 
 func init() {
@@ -52,7 +54,6 @@ func init() {
 	}
 }
 
-// processEntry tracks a background `docker exec` process.
 type processEntry struct {
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
@@ -109,13 +110,14 @@ func main() {
 	ws := workspace.New(root)
 	pt := newProcessTable()
 
-	// Ensure persistent sandbox container is running.
-	if err := ensureSandbox(ws.Root()); err != nil {
-		fmt.Fprintf(os.Stderr, "claw-exec: sandbox setup failed: %v\n", err)
+	// Detect runtime
+	runtime = detectRuntime()
+	if err := setupRuntime(ws.Root()); err != nil {
+		fmt.Fprintf(os.Stderr, "claw-exec: runtime setup failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	srv := mcpserver.New("claw-exec", "0.3.0")
+	srv := mcpserver.New("claw-exec", "1.0.0")
 	registerTools(srv, ws, pt)
 
 	if err := srv.ListenAndServe(addr); err != nil {
@@ -124,29 +126,61 @@ func main() {
 	}
 }
 
-// ensureSandbox creates or starts the persistent sandbox container.
-func ensureSandbox(workDir string) error {
-	// Check if container already exists and is running.
+// ─── Runtime detection and setup ───────────────────────────────────
+
+func detectRuntime() string {
+	if r := os.Getenv("CLAW_EXEC_RUNTIME"); r != "" {
+		return r
+	}
+	// Prefer bwrap if rootfs exists and bwrap is available
+	if _, err := os.Stat(rootfsDir); err == nil {
+		if _, err := exec.LookPath("bwrap"); err == nil {
+			return "bwrap"
+		}
+	}
+	return "docker"
+}
+
+func setupRuntime(workDir string) error {
+	switch runtime {
+	case "bwrap":
+		return setupBwrap(workDir)
+	case "docker":
+		return setupDocker(workDir)
+	default:
+		return fmt.Errorf("unknown runtime %q", runtime)
+	}
+}
+
+func setupBwrap(workDir string) error {
+	// Create persistent agent home for pip/npm state
+	dataDir := os.Getenv("CLAW_DATA_DIR")
+	if dataDir == "" {
+		dataDir = workDir
+	}
+	agentHome = dataDir + "/.agent-home"
+	if err := os.MkdirAll(agentHome, 0o755); err != nil {
+		return fmt.Errorf("create agent home: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "claw-exec: runtime=bwrap rootfs=%s home=%s\n", rootfsDir, agentHome)
+	return nil
+}
+
+func setupDocker(workDir string) error {
 	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", sandboxName).Output()
 	if err == nil && strings.TrimSpace(string(out)) == "true" {
-		fmt.Fprintf(os.Stderr, "claw-exec: sandbox %s already running\n", sandboxName)
+		fmt.Fprintf(os.Stderr, "claw-exec: runtime=docker container=%s (reattached)\n", sandboxName)
 		return nil
 	}
-
-	// Remove stale container.
 	_ = exec.Command("docker", "rm", "-f", sandboxName).Run()
 
-	// Create persistent container.
 	args := []string{
-		"run", "-d",
-		"--name", sandboxName,
+		"run", "-d", "--name", sandboxName,
 		"--network", networkMode,
-		"--memory", memoryLimit,
-		"--cpus", cpuLimit,
+		"--memory", memoryLimit, "--cpus", cpuLimit,
 		"--pids-limit", pidsLimit,
 		"--security-opt", "no-new-privileges",
-		"-v", workDir + ":/workspace",
-		"-w", "/workspace",
+		"-v", workDir + ":/workspace", "-w", "/workspace",
 	}
 	for _, env := range proxyEnvVars {
 		args = append(args, "-e", env)
@@ -158,11 +192,49 @@ func ensureSandbox(workDir string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "claw-exec: sandbox %s started (image: %s)\n", sandboxName, sandboxImage)
+	fmt.Fprintf(os.Stderr, "claw-exec: runtime=docker container=%s started\n", sandboxName)
 	return nil
 }
 
-// dockerExec builds a `docker exec` command for the persistent sandbox.
+// ─── Command execution (runtime-agnostic) ──────────────────────────
+
+func sandboxExec(ctx context.Context, workDir, command string, interactive bool) *exec.Cmd {
+	switch runtime {
+	case "bwrap":
+		return bwrapExec(ctx, workDir, command, interactive)
+	default:
+		return dockerExec(ctx, command, interactive)
+	}
+}
+
+func bwrapExec(ctx context.Context, workDir, command string, interactive bool) *exec.Cmd {
+	args := []string{
+		"--ro-bind", rootfsDir, "/",
+		"--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+		"--proc", "/proc",
+		"--dev", "/dev",
+		"--tmpfs", "/tmp",
+		"--bind", agentHome, "/home/agent",
+		"--bind", workDir, "/workspace",
+		"--setenv", "HOME", "/home/agent",
+		"--setenv", "PATH", "/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+		"--setenv", "PYTHONUNBUFFERED", "1",
+		"--setenv", "DEBIAN_FRONTEND", "noninteractive",
+		"--chdir", "/workspace",
+		"--unshare-pid",
+		"--die-with-parent",
+	}
+	for _, kv := range proxyEnvVars {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			args = append(args, "--setenv", parts[0], parts[1])
+		}
+	}
+	args = append(args, "--", "sh", "-c", command)
+	return exec.CommandContext(ctx, "bwrap", args...)
+}
+
 func dockerExec(ctx context.Context, command string, interactive bool) *exec.Cmd {
 	args := []string{"exec"}
 	if interactive {
@@ -172,16 +244,18 @@ func dockerExec(ctx context.Context, command string, interactive bool) *exec.Cmd
 	return exec.CommandContext(ctx, "docker", args...)
 }
 
-func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
+// ─── MCP tool registration ─────────────────────────────────────────
+
+func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
 	srv.AddTool(mcpserver.Tool{
 		Name:        "exec",
-		Description: "Execute a shell command in the persistent sandbox. pip/npm installs persist across calls.",
+		Description: "Execute a shell command in the sandbox. pip/npm installs persist across calls.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"command"},
 			"properties": map[string]any{
-				"command":    map[string]any{"type": "string", "description": "Shell command to execute"},
-				"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 30000, max 300000)"},
+				"command":    map[string]any{"type": "string", "description": "Shell command"},
+				"timeout_ms": map[string]any{"type": "integer", "description": "Timeout ms (default 30000, max 300000)"},
 			},
 		}),
 	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
@@ -204,7 +278,7 @@ func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 		execCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		cmd := dockerExec(execCtx, p.Command, false)
+		cmd := sandboxExec(execCtx, ws.Root(), p.Command, false)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &limitedWriter{w: &stdout, limit: maxOutputBytes}
 		cmd.Stderr = &limitedWriter{w: &stderr, limit: maxOutputBytes}
@@ -238,7 +312,7 @@ func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 			"type":     "object",
 			"required": []string{"command"},
 			"properties": map[string]any{
-				"command": map[string]any{"type": "string", "description": "Shell command"},
+				"command": map[string]any{"type": "string"},
 			},
 		}),
 	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
@@ -249,7 +323,7 @@ func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
 		}
 
-		cmd := dockerExec(context.Background(), p.Command, true)
+		cmd := sandboxExec(context.Background(), ws.Root(), p.Command, true)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
@@ -313,7 +387,7 @@ func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 
 	srv.AddTool(mcpserver.Tool{
 		Name:        "process_poll",
-		Description: "Read output from a background process and check if still running.",
+		Description: "Read output from a background process.",
 		InputSchema: jsonSchema(map[string]any{
 			"type":     "object",
 			"required": []string{"pid"},
@@ -358,7 +432,7 @@ func registerTools(srv *mcpserver.Server, _ *workspace.W, pt *processTable) {
 	})
 }
 
-// --- helpers ---
+// ─── helpers ───────────────────────────────────────────────────────
 
 type limitedWriter struct {
 	w     io.Writer
