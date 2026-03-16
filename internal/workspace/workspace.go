@@ -210,6 +210,41 @@ func (w *W) EnsureRoot() error {
 	return os.MkdirAll(w.root, 0o755)
 }
 
+// AtomicWrite writes data to a file atomically via temp file + rename.
+// This prevents partial writes from corrupting files (TOCTOU safety).
+func AtomicWrite(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, ".saki-atomic-*")
+	if err != nil {
+		return fmt.Errorf("atomic write: create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("atomic write: write: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("atomic write: chmod: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("atomic write: close: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("atomic write: rename: %w", err)
+	}
+	return nil
+}
+
 // --- internal ---
 
 func (w *W) resolveIn(root, path string) (string, error) {

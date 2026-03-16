@@ -126,10 +126,7 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.ErrorResult(err.Error())
 		}
 
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-			return mcpserver.ErrorResult(err.Error())
-		}
-		if err := os.WriteFile(abs, []byte(p.Content), 0o600); err != nil {
+		if err := workspace.AtomicWrite(abs, []byte(p.Content), 0o600); err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
 		return mcpserver.SuccessResult("ok")
@@ -169,29 +166,30 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 		}
 
 		content := string(data)
-		count := strings.Count(content, p.OldString)
-		switch count {
-		case 0:
-			return mcpserver.ErrorResult("old_string not found in file")
-		case 1:
-			// ok
-		default:
-			return mcpserver.ErrorResult(fmt.Sprintf("old_string found %d times; must be unique", count))
+
+		// 4-level fuzzy matching (exact → trim end → trim all → normalize punctuation)
+		idx, level := workspace.FuzzyFindLevel(content, p.OldString)
+		if idx < 0 {
+			return mcpserver.ErrorResult("old_string not found in file (tried 4-level fuzzy matching)")
 		}
 
-		// Write to upper layer.
+		// Replace at the found position
+		result := content[:idx] + p.NewString + content[idx+len(p.OldString):]
+
+		// Write to upper layer with atomic write
 		writeAbs, err := ws.Resolve(p.Path)
 		if err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
-		result := strings.Replace(content, p.OldString, p.NewString, 1)
-		if err := os.MkdirAll(filepath.Dir(writeAbs), 0o755); err != nil {
+		if err := workspace.AtomicWrite(writeAbs, []byte(result), 0o600); err != nil {
 			return mcpserver.ErrorResult(err.Error())
 		}
-		if err := os.WriteFile(writeAbs, []byte(result), 0o600); err != nil {
-			return mcpserver.ErrorResult(err.Error())
+
+		msg := "ok"
+		if level > 1 {
+			msg = fmt.Sprintf("ok (fuzzy match level %d)", level)
 		}
-		return mcpserver.SuccessResult("ok")
+		return mcpserver.SuccessResult(msg)
 	})
 
 	srv.AddTool(mcpserver.Tool{
@@ -343,6 +341,48 @@ func registerTools(srv *mcpserver.Server, ws *workspace.W) {
 			return mcpserver.SuccessResult("no matches found")
 		}
 		return mcpserver.SuccessResult(buf.String())
+	})
+
+	// --- apply_patch: multi-file patch tool ---
+	srv.AddTool(mcpserver.Tool{
+		Name: "apply_patch",
+		Description: `Apply a multi-file patch. Format:
+*** Begin Patch
+*** Update File: path/to/file
+@@ optional context
+-old line
++new line
+ context line
+*** Add File: path/to/new
++new content
+*** Delete File: path/to/remove
+*** End Patch`,
+		InputSchema: jsonSchema(map[string]any{
+			"type":     "object",
+			"required": []string{"patch"},
+			"properties": map[string]any{
+				"patch": map[string]any{"type": "string", "description": "Multi-file patch in *** Begin/End Patch format"},
+			},
+		}),
+	}, func(ctx context.Context, args json.RawMessage) *mcpserver.CallToolResult {
+		var p struct {
+			Patch string `json:"patch"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return mcpserver.ErrorResult("invalid arguments: " + err.Error())
+		}
+
+		ops, err := workspace.ParsePatch(p.Patch)
+		if err != nil {
+			return mcpserver.ErrorResult("parse patch: " + err.Error())
+		}
+
+		applied, err := ws.ApplyPatch(ops)
+		if err != nil {
+			msg := strings.Join(applied, "\n")
+			return mcpserver.ErrorResult(fmt.Sprintf("patch partially applied:\n%s\nerror: %v", msg, err))
+		}
+		return mcpserver.SuccessResult(strings.Join(applied, "\n"))
 	})
 }
 
