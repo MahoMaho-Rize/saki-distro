@@ -15,6 +15,7 @@ import (
 
 func newTestWeb(t *testing.T) *mcpserver.Server {
 	t.Helper()
+	t.Setenv("CLAW_WEB_DISABLE_SSRF_CHECK", "1") // tests use localhost mock servers
 	srv := mcpserver.New("test-web", "0.1.0")
 	registerTools(srv)
 	return srv
