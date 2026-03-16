@@ -1,16 +1,11 @@
 // claw is a CLI for interacting with the TAG Gateway-based coding agent.
 // It provides multi-turn conversation with automatic session management,
 // SSE streaming output, and real-time agent execution tree rendering.
-//
-// Usage:
-//
-//	claw "create a hello world in Python and run it"
-//	claw -s mysession "read the file I created earlier"
-//	echo "fix this bug" | claw
 package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -122,9 +118,9 @@ func runTurn(endpoint, model, sessionKey, system, message string) bool {
 	return streamSSE(resp.Body)
 }
 
-// ─── SSE Stream Processing with Trace Event Rendering ────────────────────────
+// ─── SSE Stream Processing ───────────────────────────────────────────────────
 
-// traceEvent mirrors the kernel's stream.TraceEvent for JSON parsing.
+// traceEvent mirrors the kernel's stream.TraceEvent.
 type traceEvent struct {
 	Trace      string `json:"trace"`
 	Tool       string `json:"tool,omitempty"`
@@ -136,15 +132,26 @@ type traceEvent struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// treeState tracks the current execution tree for rendering.
+// treeState tracks execution tree rendering state.
 type treeState struct {
-	depth   int
-	toolIdx int
-	started time.Time
+	depth        int
+	toolIdx      int
+	started      time.Time
+	activeCancel context.CancelFunc // heartbeat goroutine cancel
 }
 
 func newTreeState() *treeState {
 	return &treeState{started: time.Now()}
+}
+
+// renderMu protects all stderr writes from concurrent access
+// (heartbeat goroutine vs main SSE processing goroutine).
+var renderMu sync.Mutex
+
+func renderStderr(format string, args ...any) {
+	renderMu.Lock()
+	defer renderMu.Unlock()
+	fmt.Fprintf(os.Stderr, format, args...)
 }
 
 // streamSSE reads SSE frames, renders content deltas to stdout,
@@ -159,7 +166,7 @@ func streamSSE(body io.Reader) bool {
 
 		// Trace events: SSE comment lines starting with ": {"
 		if strings.HasPrefix(line, ": {") {
-			handleTraceEvent(line[2:], tree) // strip ": " prefix
+			handleTraceEvent(line[2:], tree)
 			continue
 		}
 
@@ -204,41 +211,49 @@ func handleTraceEvent(data string, tree *treeState) {
 	}
 
 	prefix := treePrefix(tree.depth)
+	toolName := displayToolName(ev.Tool)
+	args := smartArgs(ev.Tool, ev.Args)
 
 	switch ev.Trace {
 	case "tool_start":
 		tree.toolIdx++
-		args := ev.Args
-		if len(args) > 60 {
-			args = args[:60] + "..."
-		}
-		fmt.Fprintf(os.Stderr, "%s├── ⚙ %s", prefix, ev.Tool)
+		stopHeartbeat(tree)
+
+		renderStderr("%s├── %s", prefix, toolName)
 		if args != "" {
-			fmt.Fprintf(os.Stderr, " (%s)", compactArgs(args))
+			renderStderr(": %s", args)
 		}
-		fmt.Fprintln(os.Stderr)
+		renderStderr("\n")
+
+		startHeartbeat(tree, prefix)
 
 	case "tool_end":
+		stopHeartbeat(tree)
 		if ev.Error != "" {
-			fmt.Fprintf(os.Stderr, "%s│   ✗ error: %s (%dms)\n", prefix, truncStr(ev.Error, 60), ev.DurationMs)
+			renderStderr("%s│   ✗ %s (%dms)\n", prefix, truncStr(ev.Error, 50), ev.DurationMs)
 		} else {
-			fmt.Fprintf(os.Stderr, "%s│   ✓ done (%dms)\n", prefix, ev.DurationMs)
+			renderStderr("%s│   └ %dms\n", prefix, ev.DurationMs)
 		}
 
 	case "delegate_start":
+		tree.toolIdx++
+		stopHeartbeat(tree)
 		tree.depth++
-		args := ev.Args
-		if len(args) > 80 {
-			args = args[:80] + "..."
+
+		renderStderr("%s├── delegate", prefix)
+		if args != "" {
+			renderStderr(": %s", args)
 		}
-		fmt.Fprintf(os.Stderr, "%s├── ⚡ delegate_task\n", prefix)
-		fmt.Fprintf(os.Stderr, "%s│   → %s\n", prefix, compactArgs(args))
+		renderStderr("\n")
+
+		startHeartbeat(tree, treePrefix(tree.depth))
 
 	case "delegate_end":
+		stopHeartbeat(tree)
 		if ev.Error != "" {
-			fmt.Fprintf(os.Stderr, "%s│   ✗ sub-agent failed: %s (%dms)\n", prefix, truncStr(ev.Error, 50), ev.DurationMs)
+			renderStderr("%s│   ✗ sub-agent failed: %s (%dms)\n", prefix, truncStr(ev.Error, 40), ev.DurationMs)
 		} else {
-			fmt.Fprintf(os.Stderr, "%s│   ✓ sub-agent done (%dms)\n", prefix, ev.DurationMs)
+			renderStderr("%s└ sub-agent done (%.1fs)\n", prefix, float64(ev.DurationMs)/1000)
 		}
 		if tree.depth > 0 {
 			tree.depth--
@@ -246,11 +261,43 @@ func handleTraceEvent(data string, tree *treeState) {
 	}
 }
 
+// ─── Heartbeat (Phase 2) ─────────────────────────────────────────────────────
+
+func startHeartbeat(tree *treeState, prefix string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	tree.activeCancel = cancel
+	toolStart := time.Now()
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				elapsed := int(time.Since(toolStart).Seconds())
+				renderStderr("%s│   ... %ds\n", prefix, elapsed)
+			}
+		}
+	}()
+}
+
+func stopHeartbeat(tree *treeState) {
+	if tree.activeCancel != nil {
+		tree.activeCancel()
+		tree.activeCancel = nil
+	}
+}
+
+// ─── Rendering helpers ───────────────────────────────────────────────────────
+
 func renderDone(tree *treeState) {
-	elapsed := time.Since(tree.started)
-	fmt.Println() // newline after content
+	stopHeartbeat(tree)
+	fmt.Println()
 	if tree.toolIdx > 0 {
-		fmt.Fprintf(os.Stderr, "└── done (%d tools, %s)\n", tree.toolIdx, formatDuration(elapsed))
+		elapsed := time.Since(tree.started)
+		renderStderr("└ %d calls · %s\n", tree.toolIdx, formatDuration(elapsed))
 	}
 }
 
@@ -261,21 +308,53 @@ func treePrefix(depth int) string {
 	return strings.Repeat("│   ", depth)
 }
 
-func compactArgs(args string) string {
-	// Try to extract readable summary from JSON args
-	args = strings.TrimSpace(args)
-	if len(args) > 2 && args[0] == '{' {
-		var m map[string]interface{}
-		if json.Unmarshal([]byte(args), &m) == nil {
-			// Show first string value as summary
-			for _, v := range m {
-				if s, ok := v.(string); ok && len(s) > 0 {
-					return truncStr(s, 60)
-				}
-			}
+// displayToolName strips the MCP namespace prefix.
+// "exec__exec" → "exec", "fs__write_file" → "write_file"
+func displayToolName(name string) string {
+	if idx := strings.Index(name, "__"); idx >= 0 {
+		return name[idx+2:]
+	}
+	return name
+}
+
+// smartArgs extracts the most meaningful field from JSON args based on tool type.
+func smartArgs(toolName, rawArgs string) string {
+	if rawArgs == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(rawArgs), &m) != nil {
+		return truncStr(rawArgs, 60)
+	}
+	switch {
+	case strings.Contains(toolName, "delegate"):
+		if v, ok := m["task"]; ok {
+			return truncStr(fmt.Sprint(v), 60)
+		}
+	case strings.Contains(toolName, "exec"):
+		if v, ok := m["command"]; ok {
+			return truncStr(fmt.Sprint(v), 60)
+		}
+	case strings.Contains(toolName, "write"), strings.Contains(toolName, "read"):
+		if v, ok := m["path"]; ok {
+			return truncStr(fmt.Sprint(v), 60)
+		}
+	case strings.Contains(toolName, "grep"):
+		if v, ok := m["pattern"]; ok {
+			return truncStr(fmt.Sprint(v), 60)
+		}
+	case strings.Contains(toolName, "glob"):
+		if v, ok := m["pattern"]; ok {
+			return truncStr(fmt.Sprint(v), 60)
 		}
 	}
-	return truncStr(args, 60)
+	// Fallback: first string value
+	for _, v := range m {
+		if s, ok := v.(string); ok && len(s) > 0 {
+			return truncStr(s, 60)
+		}
+	}
+	return truncStr(rawArgs, 60)
 }
 
 func truncStr(s string, maxLen int) string {
