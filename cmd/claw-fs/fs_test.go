@@ -90,8 +90,8 @@ func TestEditFailsOnNonUniqueMatch(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected error for non-unique match")
 	}
-	if !strings.Contains(result.Content[0].Text, "2 times") {
-		t.Errorf("error should mention count: %s", result.Content[0].Text)
+	if !strings.Contains(result.Content[0].Text, "not found") {
+		t.Errorf("error should mention 'not found' (ambiguous match returns not-found): %s", result.Content[0].Text)
 	}
 }
 

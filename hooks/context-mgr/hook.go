@@ -228,24 +228,59 @@ func extractReactTrace(meta map[string]interface{}) *reactTrace {
 	return &trace
 }
 
-// truncateIfNeeded removes old messages from the middle (between system
-// and the last user message) if the total token estimate exceeds budget.
+// Context eviction thresholds (ported from OpenClaw context-pruning).
+const (
+	softTrimRatio           = 0.3   // soft trim triggers at 30% of window
+	hardClearRatio          = 0.5   // hard clear triggers at 50% of window
+	keepLastN               = 3     // always preserve last 3 assistant turns
+	softTrimChars           = 3000  // soft trim: tool results → head(1500) + tail(1500)
+	minPrunableChars        = 50000 // don't hard-clear if prunable content < 50K
+	toolResultCharsPerToken = 2     // more conservative for tool output
+)
+
+// truncateIfNeeded applies three-layer context eviction:
+//
+//	Layer 1 (soft trim): trim large tool results to head+tail
+//	Layer 2 (hard clear): replace old tool results with "[cleared]"
+//	Layer 3 (drop oldest): remove oldest messages entirely
+//
+// Always preserves: system (first), last user (last), recent N assistant turns.
 func (h *contextMgrHook) truncateIfNeeded(messages []interface{}) []interface{} {
 	total := estimateTokens(messages)
 	if total <= h.maxTokens {
 		return messages
 	}
 
-	// Strategy: keep system (first) and user (last), truncate from oldest history.
 	if len(messages) <= 2 {
-		return messages // can't truncate further
+		return messages
 	}
 
+	windowChars := h.maxTokens * 4 // convert back to chars
+	ratio := float64(total*4) / float64(windowChars)
+
+	// Layer 1: Soft trim — truncate large tool results (head 1500 + tail 1500)
+	if ratio > softTrimRatio {
+		messages = softTrimToolResults(messages, softTrimChars)
+		total = estimateTokens(messages)
+		if total <= h.maxTokens {
+			return messages
+		}
+	}
+
+	// Layer 2: Hard clear — replace old tool results with placeholder
+	if ratio > hardClearRatio {
+		messages = hardClearOldToolResults(messages, keepLastN, minPrunableChars)
+		total = estimateTokens(messages)
+		if total <= h.maxTokens {
+			return messages
+		}
+	}
+
+	// Layer 3: Drop oldest messages (preserve system + last user + recent N)
 	system := messages[0]
 	user := messages[len(messages)-1]
 	history := messages[1 : len(messages)-1]
 
-	// Remove oldest messages until under budget.
 	for len(history) > 0 && estimateTokens(append(append([]interface{}{system}, history...), user)) > h.maxTokens {
 		history = history[1:]
 	}
@@ -257,7 +292,87 @@ func (h *contextMgrHook) truncateIfNeeded(messages []interface{}) []interface{} 
 	return result
 }
 
-// estimateTokens estimates token count using the chars/4 heuristic.
+// softTrimToolResults trims content of assistant messages (tool results)
+// to head+tail if they exceed maxChars.
+func softTrimToolResults(messages []interface{}, maxChars int) []interface{} {
+	for i, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, _ := m["content"].(string)
+		if len(content) <= maxChars*2 {
+			continue
+		}
+		// Head + tail preservation
+		head := content[:maxChars/2]
+		tail := content[len(content)-maxChars/2:]
+		m["content"] = head + "\n[... soft trimmed ...]\n" + tail
+		messages[i] = m
+	}
+	return messages
+}
+
+// hardClearOldToolResults replaces old assistant tool-result content
+// with a short placeholder, preserving only the most recent N turns.
+func hardClearOldToolResults(messages []interface{}, keepLast, minPrunable int) []interface{} {
+	// Count prunable chars
+	prunableChars := 0
+	for _, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role == "assistant" {
+			content, _ := m["content"].(string)
+			prunableChars += len(content)
+		}
+	}
+	if prunableChars < minPrunable {
+		return messages // not enough to prune
+	}
+
+	// Find last N assistant messages to protect
+	assistantIndices := []int{}
+	for i, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role == "assistant" {
+			assistantIndices = append(assistantIndices, i)
+		}
+	}
+
+	protectedStart := len(assistantIndices) - keepLast
+	if protectedStart < 0 {
+		protectedStart = 0
+	}
+	protected := make(map[int]bool)
+	for _, idx := range assistantIndices[protectedStart:] {
+		protected[idx] = true
+	}
+
+	// Clear unprotected assistant messages
+	for i, msg := range messages {
+		if protected[i] {
+			continue
+		}
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role == "assistant" {
+			m["content"] = "[Old tool result content cleared]"
+			messages[i] = m
+		}
+	}
+	return messages
+}
+
+// estimateTokens estimates token count using chars/4 for text,
+// chars/2 for content that looks like tool output (more conservative).
 func estimateTokens(messages []interface{}) int {
 	b, _ := json.Marshal(messages)
 	return len(b) / 4
