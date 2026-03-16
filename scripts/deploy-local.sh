@@ -90,6 +90,27 @@ mcp:
       url: "http://127.0.0.1:${BROWSER_PORT}/mcp"
       timeout_sec: 60
 
+rag:
+  enabled: ${CLAW_RAG_ENABLED:-false}
+  memory_reserve_gb: 12
+  embedding:
+    account_id: "${CF_ACCOUNT_ID}"
+    api_token: "${CF_API_TOKEN}"
+    model: "@cf/baai/bge-m3"
+    timeout_sec: 15
+  chroma_sources:
+    - url: "http://127.0.0.1:8000"
+      collections: ["wiki_zh", "moegirl"]
+    - url: "http://127.0.0.1:8001"
+      collections: ["coig_cqia", "izumi_ja_qa"]
+  top_k: 20
+  max_variants: 3
+  relevance_threshold: 1.5
+  cache_ttl_sec: 600
+  cache_max_size: 200
+  unavail_threshold: 3
+  unavail_probe_interval_sec: 60
+
 ext_proc:
   enabled: true
   default_timeout_ms: 5000
