@@ -1,15 +1,21 @@
-// context-mgr is an ext_proc hook that manages multi-turn conversation context.
+// context-mgr is an ext_proc hook that implements five-layer context management.
+//
+// Layer 1: Context Pruning — cache-aware soft trim + hard clear of old tool results
+// Layer 2: Tool Result Guard — per-call single-result cap + total budget enforcement
+// Layer 3: Session Truncation — persistent truncation when layers 1+2 are insufficient
+// Layer 4: Compaction — LLM-based summarization with quality audit
+// Layer 5: Memory Flush — pre-compaction durable memory persistence
 //
 // PRE_REQ (BODY_MUTATE):
 //   - Reads session history from session-hook metadata
 //   - Injects history into body.messages[]
-//   - Estimates token count and truncates old messages if needed
+//   - Applies Layer 2 (guard) then Layer 1 (prune)
 //   - Emits save_messages for the current user message
 //
-// POST_RESP (BODY_READ):
+// POST_RESP (HEADER_ONLY):
 //   - Reads react_trace from gateway metadata
-//   - Extracts assistant response and tool call records
-//   - Emits save_messages for session-hook to persist
+//   - Extracts assistant response for persistence
+//   - Triggers Layer 4 (compaction) and Layer 5 (flush) asynchronously
 package main
 
 import (
@@ -21,8 +27,19 @@ import (
 
 func main() {
 	maxTokens := 180000 // default context window budget (leave headroom from 200k)
-	if err := hooklib.Run(&contextMgrHook{maxTokens: maxTokens}); err != nil {
+	gatewayURL := envOrDefault("GATEWAY_URL", "http://localhost:8080")
+	compactModel := envOrDefault("COMPACT_MODEL", "claude-sonnet-4-20250514")
+
+	hook := newContextMgrHook(maxTokens, gatewayURL, compactModel)
+	if err := hooklib.Run(hook); err != nil {
 		fmt.Fprintf(os.Stderr, "context-mgr: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
