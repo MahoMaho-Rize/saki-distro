@@ -247,6 +247,9 @@ func dockerExec(ctx context.Context, command string, interactive bool) *exec.Cmd
 // ─── MCP tool registration ─────────────────────────────────────────
 
 func registerTools(srv *mcpserver.Server, ws *workspace.W, pt *processTable) {
+	// Sub-agent delegation (Agent-as-a-Tool)
+	registerDelegateTool(srv)
+
 	srv.AddTool(mcpserver.Tool{
 		Name:        "exec",
 		Description: "Execute a shell command in the sandbox. pip/npm installs persist across calls.",

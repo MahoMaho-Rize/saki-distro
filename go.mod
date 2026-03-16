@@ -2,7 +2,7 @@ module claw-distro
 
 go 1.26
 
-replace tag-gateway => /home/agent/Edge-Agent
+replace tag-gateway => /home/yujian_shi/Edge-Agent
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20250803210736-d308e07a266d
