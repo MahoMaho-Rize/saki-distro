@@ -2,7 +2,7 @@
 
 ## 前置条件
 
-- TAG Gateway 二进制（`/home/agent/Edge-Agent/tagd`）
+- TAG Gateway 二进制（`Edge-Agent/tagd (同级目录)`）
 - `bubblewrap` 已安装（`/usr/bin/bwrap`）
 - `saki-sandbox:latest` Docker 镜像已构建（首次部署自动导出为 rootfs）
 - 环境变量 `ANTHROPIC_AUTH_TOKEN`（LLM API 密钥）
@@ -10,7 +10,7 @@
 ## 快速启动
 
 ```bash
-cd /home/agent/claw-distro
+cd /path/to/claw-distro
 
 # 构建所有二进制
 make build
@@ -108,7 +108,7 @@ rootfs 位于 `.data/rootfs/`（754MB），包含 Python 3.11、Node 18、Git、
 
 ```bash
 # 启动时挂载项目
-./scripts/deploy-local.sh /home/agent/my-project
+./scripts/deploy-local.sh /path/to/your/project
 
 # 查看 agent 修改了哪些文件（仅 upper 层）
 ls .data/workspace/

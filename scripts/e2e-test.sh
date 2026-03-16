@@ -24,8 +24,8 @@ HOST_PROJECT=$(mktemp -d)     # simulates user's real project (read-only to agen
 UPPER_DIR=$(mktemp -d)        # agent's writable staging area
 SQLITE_PATH=$(mktemp -d)/sessions.db
 
-TAGD="/home/agent/Edge-Agent/tagd"
-SESSION_HOOK="/home/agent/Edge-Agent/bin/session-hook"
+TAGD="${TAGD:-$(dirname "$PROJECT_DIR")/Edge-Agent/tagd}"
+SESSION_HOOK="${SESSION_HOOK:-$(dirname "$PROJECT_DIR")/Edge-Agent/bin/session-hook}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
