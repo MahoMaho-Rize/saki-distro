@@ -150,6 +150,19 @@ func callGateway(ctx context.Context, gatewayURL, model, role, task string, dept
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Depth", strconv.Itoa(depth))
 
+	// Distributed tracing: propagate trace context.
+	// The current span becomes the child's parent.
+	traceID := readEnvTrace("X_TRACE_ID")
+	currentSpanID := readEnvTrace("X_SPAN_ID")
+	if traceID == "" {
+		traceID = fmt.Sprintf("%x", time.Now().UnixNano()) // root trace
+	}
+	childSpanID := fmt.Sprintf("%x", time.Now().UnixNano()^int64(depth))
+
+	req.Header.Set("X-Trace-ID", traceID)
+	req.Header.Set("X-Parent-Span-ID", currentSpanID) // my span → child's parent
+	req.Header.Set("X-Span-ID", childSpanID)
+
 	// Unique session ID so the sub-agent gets its own context
 	sessionID := fmt.Sprintf("sub-%d-%d", depth, time.Now().UnixMilli())
 	req.Header.Set("X-Session-ID", sessionID)
@@ -232,6 +245,13 @@ func readAgentDepth() int {
 		}
 	}
 	return 0
+}
+
+// readEnvTrace reads a trace context value from environment.
+// Environment variable names use underscores (X_TRACE_ID) since
+// hyphens aren't valid in env var names.
+func readEnvTrace(key string) string {
+	return os.Getenv(key)
 }
 
 func truncate(s string, maxLen int) string {
