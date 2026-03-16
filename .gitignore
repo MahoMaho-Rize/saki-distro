@@ -1,7 +1,21 @@
+# Build artifacts
 bin/
 *.exe
+
+# Binary outputs (compiled hooks/tools accidentally committed to root)
+/claw-*
+/context-mgr
+/tool-guard
+
+# Runtime data
 .data/
 .run/
 *.db
 *.db-shm
 *.db-wal
+
+# Rootfs export
+rootfs/
+
+# OS
+.DS_Store
