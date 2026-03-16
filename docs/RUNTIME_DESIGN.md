@@ -219,11 +219,48 @@ CLAW_EXEC_RUNTIME=bwrap   # 默认（如果 bwrap 可用）
 CLAW_EXEC_RUNTIME=docker  # 回退
 ```
 
+## 研究结论（2026-03-16 验证）
+
+### Phase A 纯宿主工具的局限
+
+bwrap `--ro-bind /usr /usr` 复用宿主工具时，NVM 安装的 node
+不在系统路径（在 `~/.config/nvm/...`），bwrap 看不到。
+Python/git 可用，node 不行。**Phase A 不能完全替代 Docker。**
+
+### 推荐方案：bwrap + Docker rootfs
+
+把 saki-sandbox Docker 镜像导出为 rootfs 目录，bwrap 绑定它：
+
+```bash
+# 一次性导出
+docker create --name tmp saki-sandbox:latest
+docker export tmp | tar -xf - -C /opt/saki-rootfs
+docker rm tmp
+
+# 每次调用
+bwrap --ro-bind /opt/saki-rootfs / \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --proc /proc --dev /dev --tmpfs /tmp \
+    --bind $AGENT_HOME /home/agent \
+    --bind $WORKSPACE /workspace \
+    --setenv HOME /home/agent \
+    --unshare-pid --die-with-parent \
+    -- sh -c "command"
+```
+
+已验证：Python 3.11 ✅ Node 18 ✅ git ✅ | 启动 ~8ms | 零 daemon |
+宿主隔离 ✅ | pip 持久化 ✅ (via persistent home bind) | rootfs 754MB
+
+### Phase B (Nix) 角色变化
+
+Nix 不再做运行时工具提供，改为**构建时镜像生成**（替代 Dockerfile），
+实现精确版本锁定 + 跨机器可重现。
+
 ## 风险
 
 | 风险 | 缓解 |
 |------|------|
 | bwrap 在某些云环境不可用 | 保留 Docker fallback |
 | user namespace 被禁用 | 检测并回退到 Docker |
-| 宿主工具缺失（Phase A） | Phase B 用 Nix 解决 |
-| bwrap 不是 OCI 标准 | 我们不需要 OCI——只需要沙箱执行 |
+| rootfs 需定期更新 | 重新 docker build + export |
+| rootfs 754MB | 只读共享，比 Docker 镜像 1GB 小 |
