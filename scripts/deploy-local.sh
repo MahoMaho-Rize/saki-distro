@@ -12,8 +12,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-TAGD="/home/agent/Edge-Agent/tagd"
-SESSION_HOOK="/home/agent/Edge-Agent/bin/session-hook"
+
+# Load environment file if present
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    set -a; source "$PROJECT_DIR/.env"; set +a
+fi
+TAGD="${TAGD:-$(dirname "$PROJECT_DIR")/Edge-Agent/tagd}"
+SESSION_HOOK="${SESSION_HOOK:-$(dirname "$PROJECT_DIR")/Edge-Agent/bin/session-hook}"
 PID_DIR="$PROJECT_DIR/.run"
 DATA_DIR="$PROJECT_DIR/.data"
 

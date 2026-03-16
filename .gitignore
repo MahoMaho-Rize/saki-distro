@@ -19,3 +19,4 @@ rootfs/
 
 # OS
 .DS_Store
+.env
